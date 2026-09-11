@@ -90,6 +90,15 @@ curl -H "api-key: <READ_KEY>" "https://你的域名/api/workouts?from=2026-09-01
 - 日期全部按 Asia/Shanghai 归天
 - iPhone 锁屏期间推送可能延迟，数据不丢，解锁后自动补推
 
+## 历史数据回填（可选）
+
+刚搭完想把过去的健康数据也导进去：HAE → Export → 手动导出 JSON（可按日期分段选），逐个文件 POST 到 API 即可：
+
+```bash
+curl -X POST -H "api-key: <WRITE_KEY>" -H "Content-Type: application/json" \
+  --data-binary @HealthAutoExport-2026-08-01.json https://你的域名/api/data
+```
+
 ## 本地验证（改代码后）
 
 ```bash
