@@ -1,0 +1,13 @@
+name = "hae-api"
+main = "src/worker.js"
+compatibility_date = "2025-08-01"
+
+# 可选：自定义域名。不填则默认使用 <name>.<你的子域>.workers.dev
+# routes = [
+#   { pattern = "your.domain.com", custom_domain = true }
+# ]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hae-health"
+database_id = "YOUR_D1_DATABASE_ID"   # npx wrangler d1 create hae-health 后回填
