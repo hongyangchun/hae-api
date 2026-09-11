@@ -4,3 +4,4 @@ node_modules/
 keys.local.md
 *.local.md
 方案与配置笔记.md
+wrangler.toml
