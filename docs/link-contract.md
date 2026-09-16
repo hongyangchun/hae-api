@@ -59,7 +59,9 @@ curl -H "api-key: $READ_KEY" -H "User-Agent: hae-fetch/1.0" \
 - Automation Type: **REST API** ｜ URL: `https://hae.qiaclass.com/api/data`
 - Header: `api-key` = WRITE_KEY ｜ Export Format: **JSON**
 - Data Type: Health Metrics / Workouts 分开建
-- **Aggregate Data: 关闭（最关键）**：HAE 客户端聚合语义错误——把日合计做成分段平均（实测步程 4.1km/天只推来 0.016km）。关掉后推原始分段数据，服务端自己聚合
+- **Aggregate Data: 开启**，Aggregate Interval: **Days**（v10 下必须开启：关闭会让睡眠数据退化成分段碎片，被服务端准入门禁拒收）
+
+> 这条结论有过一次反转，接入前值得知道：早期 HAE 版本开启聚合后会把「日合计」错误地做成分段平均（实测步程 4.1 km/天只推来 0.016 km），当时的正确做法是关闭。服务端补上按天聚合（`aggregateMetric()` 对累计型求和）后，该问题已被吸收 —— 每天 1 点求和 = 原值，不会算错。详细论证见 [deployment.md 第 3.3 节](deployment.md#33-聚合数据开关必须搞清的一个坑)。
 - Batch Requests: 开；历史回填用 Manual Export 按月分段推（写库是 UPSERT，重复推幂等不怕重）
 
 **服务端聚合规则**（`src/worker.js`）：

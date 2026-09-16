@@ -263,7 +263,7 @@ export async function handleIngest(request, env) {
   if (!env.WRITE_KEY || request.headers.get('api-key') !== env.WRITE_KEY)
     return json({ error: 'unauthorized' }, 401);
 
-  const raw = await request.text(); // 先取原文，出错时留证据
+  const raw = await request.text(); // 先取原文再解析，便于对非法 JSON 返回 400
   let payload;
   try { payload = JSON.parse(raw); } catch { return json({ error: 'invalid json' }, 400); }
   try {
@@ -287,23 +287,6 @@ export async function handleIngest(request, env) {
   const skipSleepMetric = (m) => !isSleepBackfill && isSegSleep(m) && !isSummarySleep(m);
   const skippedSleep = allMetrics.filter((m) => String(m?.name) === 'sleep_analysis' && skipSleepMetric(m)).length;
   const metrics = allMetrics.filter((m) => String(m?.name) !== 'sleep_analysis' || !skipSleepMetric(m));
-
-  // 诊断：提取 sleep_analysis 结构样本（修完移除）
-  try {
-    const sleepM = metrics.find((m) => String(m?.name) === 'sleep_analysis');
-    if (sleepM) {
-      const pts = Array.isArray(sleepM.data) ? sleepM.data : [];
-      // 紧凑样本：全量点关键字段 + value 标签分布（直方图）
-      const labels = {};
-      for (const p of pts) { const k = String(p?.value ?? p?.sleepStage ?? '?'); labels[k] = (labels[k] || 0) + 1; }
-      const compact = pts.slice(0, 150).map((p) => ({ v: p?.value, q: p?.qty, s: p?.start || p?.startDate, e: p?.end || p?.endDate, src: p?.source }));
-      const sample = JSON.stringify({ pt_count: pts.length, labels, compact });
-      await env.DB.prepare('CREATE TABLE IF NOT EXISTS debug_sleep_sample (ts TEXT, sample TEXT)').run();
-      await env.DB.prepare('INSERT INTO debug_sleep_sample (ts, sample) VALUES (?1, ?2)')
-        .bind(new Date().toISOString(), JSON.stringify(sample).slice(0, 100000)).run();
-      await env.DB.prepare('DELETE FROM debug_sleep_sample WHERE ts NOT IN (SELECT ts FROM debug_sleep_sample ORDER BY ts DESC LIMIT 3)').run();
-    }
-  } catch (_) {}
 
   const stmts = [];
   let metricRowCount = 0;
@@ -340,26 +323,16 @@ export async function handleIngest(request, env) {
   for (let i = 0; i < stmts.length; i += CHUNK)
     await env.DB.batch(stmts.slice(i, i + CHUNK));
 
-  // 累计型指标若每天只来 1 个点，多半是 HAE「聚合」把日合计错误地平均了
+  // 曾在此检测「累计型指标每天只有 1 个点 → 建议关闭 Aggregate Data」并写入 warnings。
+  // 该告警已移除：服务端 aggregateMetric() 对累计型按天求和，HAE 开启聚合后「每天 1 个点」
+  // 正是推荐配置，检测必然误报。字段保留为空数组，以免破坏已有消费方的响应解析。
   const warnings = [];
-  if (!preAggregated)
-    for (const m of metrics) {
-      if (!SUM_METRICS.has(m?.name)) continue;
-      const pts = Array.isArray(m.data) ? m.data : [];
-      const dates = new Set(pts.map((p) => dayKey(p?.date || p?.startDate || p?.sleepStart)).filter(Boolean));
-      if (pts.length >= 3 && dates.size >= 3 && pts.length === dates.size)
-        warnings.push(`「${m.name}」每天只有 1 个点：请在自动化里关闭 Aggregate Data（开启时累计型指标会被错误平均）`);
-    }
 
   return json({ ok: true, metric_rows: metricRowCount, workouts: workoutCount, warnings, sleep_skipped: skippedSleep });
   } catch (e) {
-    // 诊断：异常时把错误 + 原始 payload 存入 debug_errors，500 响应体带回摘要
+    // 只写 Workers 日志（`wrangler tail` 可见）。不再把原始 payload 回写数据库——
+    // 那会把完整健康数据原文落库，属于隐私风险。
     console.error('ingest failed:', e?.stack || e);
-    try {
-      await env.DB.prepare('CREATE TABLE IF NOT EXISTS debug_errors (ts TEXT, err TEXT, body TEXT)').run();
-      await env.DB.prepare('INSERT INTO debug_errors (ts, err, body) VALUES (?1, ?2, ?3)')
-        .bind(new Date().toISOString(), String(e?.stack || e), raw.slice(0, 200000)).run();
-    } catch (_) { /* 调试记录失败不掩盖原错误 */ }
     return json({ error: 'ingest failed', detail: String(e?.stack || e).slice(0, 500) }, 500);
   }
 }

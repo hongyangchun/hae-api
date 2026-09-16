@@ -52,7 +52,7 @@ Automations → New Automation（健康指标、锻炼各建一个）：
 - Headers: `api-key` = WRITE_KEY
 - Data Type: Health Metrics / Workouts（分开两个自动化）
 - Export Format: **JSON**
-- **Aggregate Data: 开**，Aggregate Interval: **Days** ← 不开会触发服务端 warnings
+- **Aggregate Data: 开**，Aggregate Interval: **Days** ← 不开会导致睡眠数据被服务端准入门禁拒收
 - Batch Requests: 开
 - 历史回填：Manual Export 按月分段选日期导出
 
@@ -62,3 +62,13 @@ Automations → New Automation（健康指标、锻炼各建一个）：
 node scripts/test_ingest.mjs   # 用 iCloud 里真实导出数据跑解析+mock 入库
 npx wrangler dev               # 本地起 Worker，curl POST /api/data 实测
 ```
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/stack-overview.md`](docs/stack-overview.md) | **建议先读**：这套栈由哪几块组成、各在哪、关键决策与「不要做的事」 |
+| [`docs/deployment.md`](docs/deployment.md) | 从零部署：六步、HAE 配置、「聚合数据」开关的正确设置、验收清单、排错速查、安全基线 |
+| [`docs/link-contract.md`](docs/link-contract.md) | 数据契约：字段、`slot` 语义、写侧/读侧链路、必守规则 |
+| [`docs/read-only-quickstart.md`](docs/read-only-quickstart.md) | 只读接入极简版（给需要用数据的人） |
+| [`docs/design-notes.md`](docs/design-notes.md) | 设计笔记：选型理由、原理、踩过的坑 |

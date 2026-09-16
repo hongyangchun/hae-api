@@ -39,8 +39,7 @@ iPhone HAE ──REST推送──▶ Cloudflare Worker (hae.qiaclass.com)
 - Worker 校验 HTTP 头 `api-key`，不匹配返回 401；仪表盘走 Cookie（见 Step 3）
 
 ### 2. 服务端正确聚合（本项目最大的坑，见第五节）
-HAE 自带的「Aggregate Data」对**累计型指标语义错误**（把日合计做成分段平均）。
-所以：**iPhone 关闭聚合、推原始分段数据，Worker 收到后自己按天聚合**：
+无论 iPhone 侧聚合开关怎么设，**Worker 收到数据后都会按天重新聚合**（累计型求和、瞬时型平均），数据正确性由服务端保证：
 
 | 数据类型 | 规则 | 例子 |
 |---|---|---|
@@ -48,6 +47,8 @@ HAE 自带的「Aggregate Data」对**累计型指标语义错误**（把日合�
 | 心率（带 Avg/Min/Max 字段） | avg 取均值、min 取最小、max 取最大 | heart_rate |
 | 睡眠 | 直接取当日值（total/deep/rem/core/awake/inbed，单位小时） | sleep_analysis |
 | 其余瞬时型 | 当天各分段**求平均** | HRV、血氧、静息心率、体重、呼吸率 |
+
+iPhone 侧的正确配置是**开启聚合**（Aggregate Interval = Days）。早期版本开启后会把日合计错误地做成分段平均，但该 bug 的影响已被服务端的按天聚合吸收（每天 1 点求和 = 原值）；而在 v10 下**关闭**聚合会让睡眠退化成碎片、被准入门禁拒收。完整论证见 [deployment.md 第 3.3 节](deployment.md#33-聚合数据开关必须搞清的一个坑)。
 
 - 日期统一按 **Asia/Shanghai** 归天（和 iPhone 上看到的一致）
 - 写库用 UPSERT（按 指标+日期+slot 主键覆盖），**重复推送幂等**，回填不怕重
