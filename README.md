@@ -12,8 +12,13 @@ iPhone Health Auto Export (HAE) → Cloudflare Worker（收数据+查询 API）�
 | GET | `/api/metrics` | `api-key: READ_KEY` | 指标清单（名称/单位/日期范围） |
 | GET | `/api/query?name=step_count&from=2026-01-01&to=2026-09-01` | `api-key: READ_KEY` | 指标时间序列 |
 | GET | `/api/workouts?from=...&to=...` | `api-key: READ_KEY` | 锻炼记录 |
+| GET/POST | `/dashboard` | `DASH_TOKEN`（口令换 Cookie） | 内置仪表盘（ECharts） |
 
 日期均按 Asia/Shanghai 归天。数据格式兼容 HAE REST API JSON（与 iCloud 导出同源）。
+
+`/dashboard` 内嵌于 `src/dashboard.js`（`dashboardHTML()`），随 Worker 一起部署，
+**不需要单独托管、额外域名或独立仓库**。它走 `DASH_TOKEN` 口令 + 一年期签名 Cookie，
+与上表的 `api-key` 头是两套彼此独立的鉴权体系。
 
 > **密钥安全**：所有密钥（READ_KEY / WRITE_KEY / DASH_TOKEN）只在本地 `keys.local.md` 和 wrangler secrets 里，不入库。
 > **HAE v10 注意**：「健康 rest」自动化的「汇总数据」开关必须开启，否则睡眠数据会退化成碎片（服务端只收汇总格式，拒收碎片，见 worker.js 准入门禁）。
