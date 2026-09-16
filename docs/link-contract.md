@@ -26,13 +26,18 @@ Apple Watch 10 ──▶ iPhone 健康 App
 | GET | `/` | 健康检查（公开） |
 | GET | `/api/metrics` | 指标清单（名称/单位/覆盖日期范围/点数） |
 | GET | `/api/query?name=X&from=YYYY-MM-DD&to=YYYY-MM-DD[&convert=kcal\|km]` | 指标时间序列 |
+| GET | `/api/query?name=vo2_max_est[&hrmax=185]` | 心肺耐力估算（派生指标，不落库） |
 | GET | `/api/workouts?from=&to=` | 锻炼记录 |
 
 **响应格式**：
 - `/api/query` → `{"units": "...", "points": [{"date": "YYYY-MM-DD", "qty": 123, ...}]}`
 - 日期闭区间（含 from 与 to），按 **Asia/Shanghai** 归天（与 iPhone 显示一致）
-- `slot` 字段：普通指标是 `qty`；`heart_rate` 是 `avg/min/max` 三列；`sleep_analysis` 是 `total/deep/rem/core/awake/inbed`（单位：小时）
+- `slot` 字段：普通指标是 `qty`；`heart_rate` 是 `avg/min/max` 三列；`sleep_analysis` 是 `total/deep/rem/core/unclassified/awake/inbed`（单位：小时）
 - 能量类默认 kJ，加 `&convert=kcal` 换算；距离加 `&convert=km`
+- `vo2_max_est` 走同一个 `/api/query` 入口但**不在 `metric_points` 里**，是读时按
+  `15 × HRmax / HRrest` 现算的；`qty` 之外每天还带 `rhr7` / `rhr_n`，响应顶层带
+  `hrmax_ref` / `hrmax_source`。数据不足时 `points` 为空且带 `reason`，**不是报错**。
+  另有 `vo2_max` 这个原始指标，本账号**恒为空数组**（Apple 不测），别拿它当数据缺失。
 
 **必踩的坑（都会导致对接失败或读错数）**：
 1. **Python urllib/requests 默认 UA 会被 403 拦截** → 请求必须带自定义 User-Agent（如 `hae-fetch/1.0`）
@@ -40,6 +45,7 @@ Apple Watch 10 ──▶ iPhone 健康 App
 3. **睡眠日期 = 醒来那天早晨**：查「昨晚睡眠」要取**今天**的 `sleep_analysis` 点；白天出现的当日残夜点（total<1h、结构全零）是噪音，过滤掉
 4. 能量不传 `convert=kcal` 会差 4.184 倍（kJ 当 kcal 看错数量级）
 5. workers.dev 域名大陆被 DNS 污染，必须用 `hae.qiaclass.com` 自定义域
+6. **静息心率/HRV 的值在 `qty` 槽**，不是 `avg`（`avg` 只属于聚合心率 `heart_rate`）；历史上一批回填数据曾写错槽，已用迁移脚本并入 `qty`
 
 **快速验证**：
 ```bash

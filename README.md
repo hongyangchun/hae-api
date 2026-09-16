@@ -11,10 +11,17 @@ iPhone Health Auto Export (HAE) → Cloudflare Worker（收数据+查询 API）�
 | GET | `/` | 公开 | 健康检查 |
 | GET | `/api/metrics` | `api-key: READ_KEY` | 指标清单（名称/单位/日期范围） |
 | GET | `/api/query?name=step_count&from=2026-01-01&to=2026-09-01` | `api-key: READ_KEY` | 指标时间序列 |
+| GET | `/api/query?name=vo2_max_est[&hrmax=185]` | `api-key: READ_KEY` | 心肺耐力估算（**派生指标**，读时计算、不落库） |
 | GET | `/api/workouts?from=...&to=...` | `api-key: READ_KEY` | 锻炼记录 |
 | GET/POST | `/dashboard` | `DASH_TOKEN`（口令换 Cookie） | 内置仪表盘（ECharts） |
 
 日期均按 Asia/Shanghai 归天。数据格式兼容 HAE REST API JSON（与 iCloud 导出同源）。
+
+**派生指标**：`vo2_max_est` 按 Uth 公式 `15 × HRmax / HRrest` 估算心肺耐力
+（Apple Watch 只在户外步行/跑步时测 Cardio Fitness，只做力量/间歇/骑行的话
+`vo2_max` 恒为空）。HRmax 取 90 天滚动窗口内的实测最大值，HRrest 取 7 日滚动均值；
+响应里带 `hrmax_ref` / `hrmax_source` 与每天的 `rhr7` 便于解释。个体误差约 ±10~15%，
+**只看趋势**。原理与守卫见 [`docs/design-notes.md`](docs/design-notes.md) 第三节第 6 小节。
 
 `/dashboard` 内嵌于 `src/dashboard.js`（`dashboardHTML()`），随 Worker 一起部署，
 **不需要单独托管、额外域名或独立仓库**。它走 `DASH_TOKEN` 口令 + 一年期签名 Cookie，

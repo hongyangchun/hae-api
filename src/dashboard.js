@@ -68,26 +68,47 @@ function last(pts,k){for(var i=pts.length-1;i>=0;i--){var v=k?pts[i][k]:pts[i].q
 function scalarize(pts){return pts.map(function(p){return{date:p.date,qty:(p.qty!=null?p.qty:p.avg)}})}
 // 未分类睡眠：Apple 的 asleepUnspecified。老数据没有该槽，用「总时长-已分类」推导
 function unclass(p){if(p.unclassified!=null)return p.unclassified;var s=(p.deep||0)+(p.rem||0)+(p.core||0);return p.total!=null?Math.max(0,Math.round((p.total-s)*1000)/1000):null}
+/* ---- 心肺耐力(VO2max)参考带 ----
+ * 数值来自 Cooper Institute 的 ACLS 队列，即 ACSM《运动测试与运动处方指南》第 11 版
+ * (Table 4.7) 的男性百分位带。四个阈值依次是「较差|及格」「及格|一般」「一般|良好」
+ * 「良好|优秀」的分界。
+ *   成人一般人群基线，含大量久坐者 —— 「一般」= 和全部同龄人比处于中段，
+ *   不等于「不健康」。看自己这条线的走向比看等级更有意义。
+ * 只用于画参考线和标等级，不参与任何计算。年龄改 PROF.age 即可。
+ */
+var PROF={sex:'male',age:40};
+var BANDS={20:[37.4,44.7,50.8,57.3],30:[34.0,39.7,45.0,51.5],40:[30.2,35.3,40.6,47.3],50:[25.7,30.3,35.3,41.6],60:[22.4,26.3,30.6,36.3],70:[19.3,22.7,26.7,32.4]};
+var BAND_LABELS=['较差','及格','一般','良好','优秀'];
+function bandOf(v){
+ if(v==null||isNaN(v))return null;
+ var dec=Math.floor(PROF.age/10)*10;var t=BANDS[dec]||BANDS[40];
+ for(var i=0;i<4;i++)if(v<t[i])return{v:v,i:i,label:BAND_LABELS[i],lo:i?t[i-1]:null,hi:t[i],bands:t};
+ return{v:v,i:4,label:BAND_LABELS[4],lo:t[3],hi:null,bands:t};
+}
+function bandDesc(){var dec=Math.floor(PROF.age/10)*10;return '男 '+dec+'-'+(dec+9)}
 function chart(id){var el=document.getElementById(id);if(!el)return null;if(!CH[id]&&window.echarts)CH[id]=echarts.init(el);return CH[id]}
 function draw(id,title,pts,series,opts){
  var box=document.getElementById(id);if(!box)return;
  if(!pts.length){box.innerHTML='<div class="err">暂无数据</div>';return}
  var c=chart(id);if(!c)return;
- var o={backgroundColor:'transparent',title:{text:title,left:6,top:4,textStyle:{fontSize:13,color:'#c9d1d9'}},
+ var sub=(opts&&opts.sub)||'';
+ var ttl={text:title,left:6,top:4,textStyle:{fontSize:13,color:'#c9d1d9'}};
+ if(sub){ttl.subtext=sub;ttl.subtextStyle={fontSize:10,color:'#8b949e'};ttl.itemGap=3}
+ var o={backgroundColor:'transparent',title:ttl,
   tooltip:{trigger:'axis'},legend:{show:series.length>1,bottom:0,textStyle:{color:'#8b949e',fontSize:11}},
-  grid:{left:44,right:14,top:34,bottom:series.length>1?38:24},
+  grid:{left:44,right:14,top:sub?50:34,bottom:series.length>1?38:24},
   xAxis:{type:'category',data:pts.map(function(p){return p.date.slice(5)}),axisLabel:{color:'#8b949e',fontSize:10}},
   yAxis:Object.assign({type:'value',axisLabel:{color:'#8b949e',fontSize:10},splitLine:{lineStyle:{color:'#21262d'}}},(opts&&opts.y)||{}),
   series:series.map(function(s){return Object.assign({type:s.type||'line',name:s.name,data:s.data,smooth:true,barMaxWidth:18,symbolSize:4,lineStyle:{width:2},itemStyle:{color:s.color}},s.extra||{})})};
  c.setOption(o,true);}
 function addPanel(id,title,wide){var g=document.getElementById('grid');var d=document.createElement('div');d.className='panel'+(wide?' wide':'');d.innerHTML='<h3>'+title+'</h3><div class="chart" id="'+id+'"></div>';g.appendChild(d)}
-function addCard(k,v,unit,d){var c=document.getElementById('cards');var e=document.createElement('div');e.className='card';e.innerHTML='<div class="k">'+k+'</div><div class="v">'+v+'<span style=font-size:12px;color:#8b949e> '+unit+'</span></div><div class="d">'+d+'</div>';c.appendChild(e)}
+function addCard(k,v,unit,d){var c=document.getElementById('cards');var e=document.createElement('div');e.className='card';e.innerHTML='<div class="k">'+k+'</div><div class="v">'+v+'<span style="font-size:12px;color:#8b949e;white-space:nowrap"> '+(unit||'')+'</span></div><div class="d">'+(d||'')+'</div>';c.appendChild(e)}
 function render(){
  Object.keys(CH).forEach(function(k){try{CH[k].dispose()}catch(e){}});CH={};
  document.getElementById('cards').innerHTML='';document.getElementById('grid').innerHTML='';
  addPanel('c1','步数');addPanel('c2','活动热量 (kcal)');addPanel('c3','睡眠结构 (小时)');addPanel('c4','心率 min/avg/max');
  addPanel('c5','静息心率 (bpm)');addPanel('c6','HRV (ms)');addPanel('c7','体重 (kg)');addPanel('c8','血氧 (%)');
- addPanel('c9','步行+跑步距离 (km)');
+ addPanel('c9','步行+跑步距离 (km)');addPanel('c10','心肺耐力 VO2max · 估算 (mL/kg/min)');
  var P={};
  var jobs=[
   load('step_count').then(function(p){P.step=p;return load('active_energy','&convert=kcal')}).then(function(p){P.ae=p}),
@@ -96,16 +117,26 @@ function render(){
   load('heart_rate_variability').then(function(p){P.hrv=scalarize(p);return load('weight_body_mass')}).then(function(p){P.wt=p}),
   load('blood_oxygen_saturation').then(function(p){P.spo2=p;return load('walking_running_distance')}).then(function(p){P.dist=p}),
   load('apple_exercise_time').then(function(p){P.ex=p}),
+  // 心肺耐力是服务端派生指标，需要读回 hrmax_ref 等元信息来解释这个数，故取整个响应体
+  get('/api/query?name=vo2_max_est&from='+from()+'&to='+to()).then(function(j){P.vo2=j.points||[];P.vmeta=j}).catch(function(){P.vo2=[];P.vmeta={}}),
   get('/api/workouts?from='+from()+'&to='+to()).then(function(j){P.wk=j.workouts||[]}).catch(function(){P.wk=[]})
  ];
  Promise.all(jobs).then(function(){
+  // 睡眠点没有 qty 槽（值是 total/deep/rem/core 分槽的），所以不能走 last() 的默认 qty 分支，
+  // 必须显式取 total。曾经把 last(P.sleep,'total') 整个对象丢给 fmt()，Number(对象) 是 NaN，
+  // 于是睡眠卡片永远显示「--」——数据其实在，是显示逻辑错了。
+  var sl=last(P.sleep).v!=null?last(P.sleep):last(P.sleep,'total');
   var cs=[['步数',fmt(last(P.step).v,0),'步',last(P.step).d],
    ['活动热量',fmt(last(P.ae).v,0),'kcal',last(P.ae).d],
-   ['睡眠',fmt(last(P.sleep).v!=null?last(P.sleep).v:last(P.sleep,'total'),1),'小时',last(P.sleep).d||last(P.sleep,'total').d],
+   ['睡眠',fmt(sl.v,1),'小时',sl.d],
    ['静息心率',fmt(last(P.rhr).v,0),'bpm',last(P.rhr).d],
    ['锻炼环',fmt(last(P.ex).v,0),'分钟',last(P.ex).d],
    ['体重',fmt(last(P.wt).v,1),'kg',last(P.wt).d]];
   cs.forEach(function(c){addCard(c[0],c[1],c[2],c[3])});
+  // VO2max 卡片：值班 + 同龄段等级（等级只是参考带，看趋势比看等级有意义）
+  var vp=P.vo2.length?P.vo2[P.vo2.length-1]:null;var vb=bandOf(vp?vp.qty:null);
+  addCard('VO2max · 估算',fmt(vp?vp.qty:null,1),'ml/kg/min',
+   vp?((vb?vb.label+' · ':'')+bandDesc()+' · '+vp.date.slice(5)):'无法估算');
   draw('c1','步数',P.step,[{name:'步数',type:'bar',data:P.step.map(function(p){return p.qty}),color:'#58a6ff'}]);
   draw('c2','活动热量 (kcal)',P.ae,[{name:'kcal',data:P.ae.map(function(p){return p.qty}),color:'#f0883e'}]);
   draw('c3','睡眠结构 (小时)',P.sleep,[
@@ -123,9 +154,28 @@ function render(){
   draw('c7','体重 (kg)',P.wt,[{name:'kg',data:P.wt.map(function(p){return p.qty}),color:'#d29922',extra:{symbolSize:6}}]);
   draw('c8','血氧 (%)',P.spo2,[{name:'%',data:P.spo2.map(function(p){return p.qty}),color:'#58a6ff'}],{y:{min:85,max:100}});
   draw('c9','步行+跑步距离 (km)',P.dist,[{name:'km',type:'bar',data:P.dist.map(function(p){return p.qty}),color:'#7ee787'}]);
+  drawVo2(P);
   renderWk(P.wk);
  });
 }
+// 心肺耐力估算图：一条趋势线 + 落在数据区间内的「参考等级分界」虚线
+function drawVo2(P){
+ var box=document.getElementById('c10');if(!box)return;
+ if(!P.vo2.length){box.innerHTML='<div class="err">无法估算：'+esc1((P.vmeta&&P.vmeta.reason)||'数据不足')+'</div>';return}
+ var vb=bandOf(P.vo2[P.vo2.length-1].qty);
+ var vs=P.vo2.map(function(p){return p.qty});
+ var lo=Math.min.apply(null,vs),hi=Math.max.apply(null,vs);var ml=[];
+ if(vb)(vb.bands||[]).forEach(function(t,i){
+  if(t>=lo-1&&t<=hi+1)ml.push({yAxis:t,label:{formatter:BAND_LABELS[i+1]+' '+t,position:'insideEndTop'}})});
+ var extra={symbolSize:5};
+ if(ml.length)extra.markLine={silent:true,symbol:'none',lineStyle:{color:'#d29922',type:'dashed',width:1},
+  label:{fontSize:10,color:'#d29922'},data:ml};
+ var hr=(P.vmeta&&P.vmeta.hrmax_ref)||'--';
+ draw('c10','心肺耐力 VO2max · 估算 (mL/kg/min)',P.vo2,
+  [{name:'估算',data:vs,color:'#39d2c0',extra:extra}],
+  {sub:'Uth 公式：15 × HRmax '+hr+' ÷ 静息心率7日均值 · 个体误差约 ±10~15%，只看趋势'});
+}
+function esc1(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function renderWk(wk){
  var g=document.getElementById('grid');var d=document.createElement('div');d.className='panel wide';
  if(!wk.length){d.innerHTML='<h3>锻炼记录</h3><div class="err">范围内暂无锻炼</div>';g.appendChild(d);return}

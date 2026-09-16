@@ -76,14 +76,56 @@ workouts(id, name, day, start, end, duration_min, kcal, distance, avg_hr, max_hr
    `asleepUnspecified`（手表没分成浅/深/REM 的那部分睡眠），必须单独成槽，
    否则堆叠图永远画不满总时长。
 
+**不是所有指标都落库**。依赖滚动窗口、每来一条新数据都要重算历史的指标，做成
+**读时计算的派生指标**，走 `/api/query` 同一个入口但不写 `metric_points`
+（目前只有一个：`vo2_max_est`，见下面第 6 节）。好处是仪表盘和 pulse 插件共用
+一份算法，不会两端各写一套然后慢慢漂移。
+
 ### 5. 查询 API
 | 端点 | 用途 |
 |---|---|
 | `GET /` | 健康检查（公开，可用作存活监控） |
-| `GET /api/metrics` | 指标清单（名称/单位/覆盖日期范围/点数） |
+| `GET /api/metrics` | 指标清单（名称/单位/覆盖日期范围/点数）**不含派生指标** |
 | `GET /api/query?name=X&from=&to=&convert=` | 某指标的时间序列 |
+| `GET /api/query?name=vo2_max_est[&hrmax=]` | 心肺耐力估算（派生，不落库） |
 | `GET /api/workouts?from=&to=` | 锻炼记录 |
 | `POST /api/data` | HAE 推送入口（`preaggregated:true` 支持 Mac 本地预聚合回填） |
+
+### 6. 心肺耐力（VO2max）估算
+
+**为什么需要估算**：Apple Watch 只在「户外步行 / 户外跑步」且带 GPS 心率时才估
+Cardio Fitness，而这个账号的锻炼全是力量训练 / 高强度间歇 / 骑行 —— 所以
+`/api/query?name=vo2_max` 实测**永远返回空数组**（D1 里零行）。`vo2_max_est`
+按 Uth–Sørensen–Overgaard 公式回退估算：
+
+```
+VO2max ≈ 15 × HRmax / HRrest        （mL/kg/min）
+```
+
+**两个输入的取法是关键**，直接决定结果能不能用：
+
+| 输入 | 取法 | 为什么 |
+|---|---|---|
+| HRmax | 滚动 90 天窗口内，`heart_rate.max` 与 `workouts.max_hr` 的**较大值** | 最大心率在数月尺度上是个常数。若拿**当天**最大值去算，实测当天区间是 64~176，会得到 18~49 的垃圾序列 |
+| HRrest | 静息心率的 **7 日滚动均值** | 静息心率本身噪声大（实测 52~66） |
+
+返回体带上 `hrmax_ref` / `hrmax_source` / 每天的 `rhr7`、`rhr_n`，让界面能解释
+这个数是怎么来的。可用 `?hrmax=185` 覆盖参考值（知道自己真实最大心率时）。
+
+守卫（任一条不满足就返回空序列 + `reason`，绝不硬凑）：
+- `hrmax_ref` 必须 ≥ 120 —— 否则说明近期没有接近力竭的记录，估算无意义；
+- 静息心率整体样本 ≥ 5 天；
+- 单日均线窗口至少 3 天 —— 数据开头几天不够就跳过该天，否则用 1~2 个点算出的
+  均线会在图上拖出一条**假的下坡**。
+
+**必须知道的局限**：
+- 个体误差约 ±10~15%，**只看趋势和量级**，不能当体检结论；
+- 按公式它本质是静息心率的单调变换（`15×HRmax/HRrest`，HRmax 是常数），所以它和
+  静息心率曲线是**镜像共线**的。它的增量价值在于：① 绝对值 + 同龄段参考带让数字
+  可解读，② 趋势方向符合直觉（涨=变好，而静息心率是跌=变好）；
+- 同龄段参考带（Cooper Institute / ACSM 第 11 版男性百分位带）只用于**画参考线和
+  标等级**，不参与任何计算；年龄段在 `dashboard.js` 顶部的 `PROF` 一行改。
+
 
 ## 四、配置流程（可复现）
 
@@ -121,7 +163,7 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 **A. 内置仪表盘（已上线，日常用这个）**
 - 日常访问：`https://hae.qiaclass.com/dashboard`（**裸地址**）
 - 新设备首次：访问 `https://hae.qiaclass.com/dashboard?t=<DASH_TOKEN>` 一次，或在登录页输口令（两者都是同一个 DASH_TOKEN 值），Cookie 记住一年
-- 暗色主题、7/30/90/365 天切换、9 张图 + 6 个指标卡 + 锻炼表；ECharts 走 npmmirror 国内 CDN
+- 暗色主题、7/30/90/365 天切换、10 张图 + 7 个指标卡 + 锻炼表；ECharts 走 npmmirror 国内 CDN
 - 换口令 = 改 DASH_TOKEN secret，所有设备 Cookie 立即失效重新登录（也是一键全员下线）
 
 **B. Grafana Cloud（备用，已闲置）**
@@ -145,14 +187,36 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 9. **睡眠数据两个语义坑**：① 日期 = 醒来那天早晨（09-03 的点 = 9-2 晚的觉），查「昨晚」要取今天的点；② 白天会推来当日的残夜点（不足 1h、结构全零），仪表盘已过滤 `total>1`；某晚 1.4h 结构全零 = 手表没戴/没测，不是数据丢了。
 10. **「静息心率缺失」其实是入库槽位分裂**（2026-09-16 修）：`metricRows()` 用 `includes('heart_rate')`、`aggregateMetric()` 用 `=== 'heart_rate'`，同一个指标被写成两个槽 —— 08-29~09-03 那批 Mac 回填数据写进 `avg`，之后 iPhone 推送写进 `qty`。仪表盘读 `avg` 于是只剩 6 天（卡在 09-03），pulse 插件读 `qty` 反而有 18 天。同一份真实数据跑两条路径即可复现。修法：判断规则收敛到 `isHrAggregate()`，存量 `avg` 行用 `scripts/migrate-2026-09-16-heart-rate-slots.sql` 并入 `qty`。
 11. **「睡眠缺失」多数是 `unclassified` 被丢了**（2026-09-16 修）：`asleep` 字段以前只是 `totalSleep` 的兜底别名，于是 Apple 的「未分类睡眠」(asleepUnspecified) 从没入库。实测 2026-09-14 该字段为 0（当晚全部睡段都分类了），2026-09-10 则是 1.71h —— 差的正是堆叠图缺的那块。极端情况 09-01 整晚未分类（total 3.55 全在 unclassified），图表只剩一根 1.66h 的「清醒」柱，看起来像整晚没数据。**注意**：另有 09-13 整天无睡眠，那是源端当晚没有睡眠记录（iCloud 明文导出里同样没有 `sleep_analysis`），不是服务端丢弃 —— 不要照着"修"。
+    修复代码只影响**新推来的数据**，历史天数得单独回填：
+    `scripts/migrate-2026-09-16-sleep-unclassified.sql`（幂等，口径与 `sleepSlotValues()` 一致：
+    `unclassified = max(0, total - (deep+rem+core))`。已执行，7 个槽位齐了）。为什么值得回填：
+    否则「仪表盘前端现推」与「API 只返 6 槽」两边长期不一致，任何直接读 API 的消费方都对不上。
 12. **`parseHaeDate()` 对 HAE 原生时间戳全部解析失败**（2026-09-16 修）：`"2026-09-13 23:24:43 +0800"` 只把日期与时间之间的空格换成 `T`，结果 `"…23:24:43 +08:00"` 里时区前仍有空格，V8 判为 Invalid Date。日期因为 `dayKey()` 还有正则兜底所以一直没错，但**所有基于时间戳的时长计算都是废的**（分段睡眠各阶段时长、锻炼 duration 兜底、在床时长）。修法：先把时区前的空格并掉再换 `T`。改完用 509 个真实时间字段做过回归，日期输出零漂移。
+13. **`Number(null) === 0` 会把「没传参数」误判成「传了 0」**（2026-09-16 修）：`vo2_max_est` 里写成
+    `numOrNull(Number(url.searchParams.get('hrmax')))` —— 参数缺失时 `get()` 返回 `null`，
+    `Number(null)` 是**有限数 0**，于是被当成「用户指定 HRmax=0」，接着被 `<120` 守卫拒掉，
+    **整个估算功能静默失效**（接口 200、返回空数组、不报错）。修法：先判空串/缺失再转换。
+    教训：`searchParams` + `Number()` 组合必须显式处理 `null`，别指望 `isFinite` 兜住。
+14. **把对象喂给 `fmt()` 会让卡片永远显示 `--`**（2026-09-16 修）：仪表盘睡眠卡片的
+    `fmt(last(P.sleep).v != null ? ... : last(P.sleep,'total'), 1)` 少写了一个 `.v`，
+    传进去的是 `{v, d}` 对象，`Number(对象)` = `NaN` → `fmt` 返回 `--`。因为**日期那一列是对的**
+    （`last(...).d`），只坏了一个格子，很容易被当成"数据缺失"而不是"显示 bug"。
+15. **仪表盘改完一定要真跑一遍渲染**（2026-09-16 起做法）：静态读代码发现不了 13/14 这类问题
+    —— 两处都是「接口 200、页面不报错、就是没数」。做法是把线上 `/dashboard` 的内联脚本抽出来，
+    用桩 `document` / 桩 `echarts`（记得 `window.echarts`，脚本读的是 `window` 上的）+ 一个把
+    相对路径补成绝对地址的 `fetch` 桩，在 Node 里跑真正的 `render()`，然后打印实际生成的卡片文案
+    和 `setOption` 的 option。这是唯一能在没有浏览器的情况下验证"看到的对不对"的办法。
+
 
 ## 六、运维备忘
 
 - **文件**：代码 `hae-api/`｜密钥与口令 `hae-api/keys.local.md`｜Grafana 备用面板 `hae-api/grafana-dashboard.json`
 - **域名**：`hae.qiaclass.com`｜**仪表盘**：`/dashboard`（裸地址，口令见 keys.local.md）｜**D1**：hae-health (id b91ee90f-e928-497c-b15a-5d5cd7d5f59b)
-- **改代码后**：`npx wrangler deploy`（10 秒生效）
+- **改代码后**：`npx wrangler deploy`（10 秒生效）。本机已 `npm i -D wrangler` 装到仓库内
+  （`node_modules/.bin/wrangler`），不用再借别处的副本
 - **手动查数**：`curl -H "api-key: <READ_KEY>" "https://hae.qiaclass.com/api/query?name=step_count"`
+- **派生指标**：`curl -H "api-key: <READ_KEY>" "https://hae.qiaclass.com/api/query?name=vo2_max_est"`
+  （带 `?hrmax=185` 可覆盖参考最大心率）
 - **免费额度**：Worker 10 万请求/天、D1 5GB 存储（年度按天数据仅几 MB）——个人用量绰绰有余
 - **与早报管线并行**：iCloud JSON → `parse_health_export.py` → 每天 08:00 简报，不受本方案影响
 - **已知小缺口**：08-29 部分指标缺数据（HealthKit 当天来源问题，非链路问题）；今天的行在次日自动推送后覆盖为完整值

@@ -7,6 +7,8 @@
  *   GET  /api/metrics              指标清单           （header: api-key = READ_KEY）
  *   GET  /api/query?name=step_count&from=2026-01-01&to=2026-09-01
  *                                  指标时间序列       （header: api-key = READ_KEY）
+ *   GET  /api/query?name=vo2_max_est[&hrmax=185]
+ *                                  心肺耐力估算（派生，不落库）  （header: api-key = READ_KEY）
  *   GET  /api/workouts?from=...&to=...  锻炼记录       （header: api-key = READ_KEY）
  *
  * 日期全部按 Asia/Shanghai 归到天，和 iPhone 上看到的一致。
@@ -45,6 +47,113 @@ function dayKey(v) {
 }
 
 const numOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+
+/** YYYY-MM-DD 加减天数。用 UTC 正午做锚点，避开夏令时/时区把日期推错一天。 */
+function shiftDay(day, delta) {
+  const d = new Date(`${day}T12:00:00Z`);
+  if (Number.isNaN(d.getTime())) return day;
+  d.setUTCDate(d.getUTCDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+
+/* ---------- 心肺耐力（VO2max）估算 ----------
+ * Apple Watch 只在「户外步行 / 户外跑步」且带 GPS 心率时才估 Cardio Fitness，
+ * 本账号的锻炼全是力量训练 / 高强度间歇 / 骑行，所以 Apple 侧 vo2_max 恒为空
+ * （实测 metric_points 里 vo2_max 零行）。于是按 Uth–Sørensen–Overgaard 公式回退估算：
+ *
+ *     VO2max ≈ 15 × HRmax / HRrest          （单位 mL/kg/min）
+ *
+ * 这个公式的个体误差约 ±10~15%，只适合看趋势和量级，不适合当体检结论。
+ *
+ * 两个输入的取法（关键，直接决定结果是否可用）：
+ *   HRmax   个人的「最大心率」在数月尺度上是常数，因此取一个滚动窗口内的实测最大
+ *           心率，而不是当天最大值。当天心率区间波动极大（实测 64~176），拿当天
+ *           最大值去算会得到 18~49 的垃圾序列。
+ *   HRrest  静息心率本身噪声大（实测 52~66），取 7 日滚动均值。
+ *
+ * 该指标是「读时计算」的派生指标，不写 metric_points —— 因为它依赖滚动窗口，
+ * 落库后每来一条新数据都要重算历史，得不偿失。仪表盘和 pulse 插件都查这一个
+ * 接口，从而共用同一套算法。
+ */
+const VO2_HRMAX_WINDOW_DAYS = 90; // HRmax 参考值的回溯窗口
+const VO2_HRMAX_MIN = 120;        // 低于此值说明从没真正发力过，估算无意义
+const VO2_RHR_WINDOW_DAYS = 7;    // 静息心率平滑窗口（天）
+const VO2_RHR_MIN_DAYS = 5;       // 静息心率整体样本下限
+const VO2_RHR_MIN_WINDOW = 3;     // 单日均线的最少样本：数据开头几天不够就跳过该天，
+                                  // 否则用 1~2 个点算出的均线会在图上拖出一条假的下坡
+
+/** 用 Uth 公式估算心肺耐力。返回 /api/query 同构的响应体。 */
+async function handleVo2MaxEst(url, env, from, to) {
+  const meta = {
+    derived: true,
+    method: 'uth',
+    formula: 'VO2max ≈ 15 × HRmax / HRrest',
+    units: 'mL/kg/min',
+    hrmax_window_days: VO2_HRMAX_WINDOW_DAYS,
+    rhr_window_days: VO2_RHR_WINDOW_DAYS,
+  };
+
+  const winStart = shiftDay(to, -VO2_HRMAX_WINDOW_DAYS);
+  // 注意：不能写成 numOrNull(Number(searchParams.get('hrmax'))) —— 参数缺失时
+  // get() 返回 null，而 Number(null) === 0 是有限数，会被误判成「用户指定 HRmax=0」，
+  // 接着被下面的 <120 守卫拒掉，整个估算功能静默失效。必须先判空串/缺失。
+  const rawHrmax = url.searchParams.get('hrmax');
+  const override = rawHrmax && Number.isFinite(Number(rawHrmax)) ? Number(rawHrmax) : null;
+
+  let hrmaxRef = override;
+  let hrmaxSource = override === null ? null : 'URL 指定 (?hrmax=)';
+  if (hrmaxRef === null) {
+    // 日聚合心率给的是全天最大；锻炼表里还可能有独立测得的最大心率。取两者较大值。
+    const row = await env.DB.prepare(
+      `SELECT MAX(m) AS m FROM (
+         SELECT MAX(qty) AS m FROM metric_points
+          WHERE metric = 'heart_rate' AND slot = 'max' AND date >= ?1 AND date <= ?2
+         UNION ALL
+         SELECT MAX(max_hr) AS m FROM workouts WHERE day >= ?1 AND day <= ?2
+       )`,
+    ).bind(winStart, to).first();
+    hrmaxRef = numOrNull(row?.m);
+    hrmaxSource = `实测最大值（${winStart} ~ ${to}）`;
+  }
+
+  if (hrmaxRef === null || hrmaxRef < VO2_HRMAX_MIN)
+    return json({
+      name: 'vo2_max_est', ...meta, hrmax_ref: hrmaxRef, hrmax_source: hrmaxSource,
+      points: [],
+      reason: `参考最大心率不足（${hrmaxRef ?? '无'} bpm < ${VO2_HRMAX_MIN}），近期没有接近力竭的运动记录，无法估算`,
+    });
+
+  // 静息心率多取 14 天，给 7 日滚动均值预热，避免区间开头几天均线偏高
+  const { results } = await env.DB.prepare(
+    `SELECT date, qty FROM metric_points
+      WHERE metric = 'resting_heart_rate' AND slot = 'qty'
+        AND date >= ?1 AND date <= ?2 ORDER BY date`,
+  ).bind(shiftDay(from, -2 * VO2_RHR_WINDOW_DAYS), to).all();
+
+  if (results.length < VO2_RHR_MIN_DAYS)
+    return json({
+      name: 'vo2_max_est', ...meta, hrmax_ref: hrmaxRef, hrmax_source: hrmaxSource,
+      points: [],
+      reason: `静息心率样本不足（${results.length} 天 < ${VO2_RHR_MIN_DAYS} 天）`,
+    });
+
+  const points = [];
+  for (let i = 0; i < results.length; i++) {
+    const date = results[i].date;
+    if (date < from || date > to) continue;
+    const win = results.slice(Math.max(0, i - VO2_RHR_WINDOW_DAYS + 1), i + 1);
+    if (win.length < VO2_RHR_MIN_WINDOW) continue;
+    const rhr7 = win.reduce((s, r) => s + r.qty, 0) / win.length;
+    if (!rhr7) continue;
+    points.push({
+      date,
+      qty: Math.round((15 * hrmaxRef / rhr7) * 10) / 10,
+      rhr7: Math.round(rhr7 * 10) / 10, // 附上输入，便于界面解释这个数是怎么来的
+      rhr_n: win.length,
+    });
+  }
+  return json({ name: 'vo2_max_est', ...meta, hrmax_ref: hrmaxRef, hrmax_source: hrmaxSource, points });
+}
 
 /* D1 bind 只接受标量：新版 HAE 个别字段可能是对象，智能取值后 JSON 兑底 */
 const scalar = (v, pick = []) => {
@@ -396,6 +505,7 @@ async function handleQuery(url, env) {
   if (!name) return json({ error: 'missing ?name=' }, 400);
   const from = url.searchParams.get('from') || '2000-01-01';
   const to = url.searchParams.get('to') || '2099-12-31';
+  if (name === 'vo2_max_est') return handleVo2MaxEst(url, env, from, to); // 派生指标：读时计算
   const convert = url.searchParams.get('convert'); // kcal: kJ→kcal, km: m→km
   const { results } = await env.DB.prepare(
     `SELECT date, slot, qty, units FROM metric_points
