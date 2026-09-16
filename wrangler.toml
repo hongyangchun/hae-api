@@ -1,0 +1,12 @@
+name = "hae-api"
+main = "src/worker.js"
+compatibility_date = "2025-08-01"
+
+routes = [
+  { pattern = "hae.qiaclass.com", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hae-health"
+database_id = "b91ee90f-e928-497c-b15a-5d5cd7d5f59b"
