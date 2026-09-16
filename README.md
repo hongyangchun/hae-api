@@ -20,22 +20,28 @@ iPhone Health Auto Export (HAE) → Cloudflare Worker（收数据+查询 API）�
 **不需要单独托管、额外域名或独立仓库**。它走 `DASH_TOKEN` 口令 + 一年期签名 Cookie，
 与上表的 `api-key` 头是两套彼此独立的鉴权体系。
 
-> **密钥安全**：所有密钥（READ_KEY / WRITE_KEY / DASH_TOKEN）只在本地 `keys.local.md` 和 wrangler secrets 里，不入库。
+> **密钥安全**：所有密钥（READ_KEY / WRITE_KEY / DASH_TOKEN）只在本地 `keys.local.md`、`DEPLOY.local.md` 和 wrangler secrets 里，不入库。
 > **HAE v10 注意**：「健康 rest」自动化的「汇总数据」开关必须开启，否则睡眠数据会退化成碎片（服务端只收汇总格式，拒收碎片，见 worker.js 准入门禁）。
 
-## 部署步骤（本机）
+## 部署
 
 ```bash
-cd health-api-cf
-npx wrangler login              # 浏览器授权
-npx wrangler d1 create hae-health   # 输出 database_id，回填 wrangler.toml
-# 编辑 wrangler.toml：填 database_id，取消 routes 注释并写上子域名
+git clone https://github.com/hongyangchun/hae-api.git && cd hae-api
+npx wrangler login                        # 浏览器授权
+npx wrangler d1 create hae-health         # 输出 database_id，填进 wrangler.toml
 npx wrangler d1 execute hae-health --remote --file=schema.sql
-npx wrangler secret put WRITE_KEY   # 随机长字符串
-npx wrangler secret put READ_KEY    # 另一个随机长字符串
+npx wrangler secret put WRITE_KEY         # 手机上传凭证
+npx wrangler secret put READ_KEY          # 查询凭证
+npx wrangler secret put DASH_TOKEN        # 仪表盘口令
 npx wrangler deploy
-curl https://你的子域名/          # 期待 {"ok":true,...}
+curl https://你的域名/                     # 期待 {"ok":true,...}
 ```
+
+> ⚠️ 仓库里的 `wrangler.toml` 是实例配置，`database_id` 与 `routes` 必须换成你自己的值，
+> 否则会把域名路由绑到别人的域名上。
+
+**完整部署指导**（含 iPhone HAE 配置、「聚合数据」开关的正确设置、验收清单、排错速查）
+→ [`docs/deployment.md`](docs/deployment.md)
 
 ## iPhone HAE 配置
 

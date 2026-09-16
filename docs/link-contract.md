@@ -82,7 +82,7 @@ curl -H "api-key: $READ_KEY" -H "User-Agent: hae-fetch/1.0" \
 
 Cloudflare 全免费方案，部署顺序：
 ```bash
-cd health-api-cf
+cd hae-api
 npx wrangler login                                # 浏览器授权
 npx wrangler d1 create hae-health                 # database_id 回填 wrangler.toml
 npx wrangler d1 execute hae-health --remote --file=schema.sql
@@ -90,11 +90,11 @@ npx wrangler secret put WRITE_KEY                 # 随机长字符串
 npx wrangler secret put READ_KEY                  # 另一个随机长字符串
 npx wrangler deploy                               # 绑自定义域名
 ```
-注意：`wrangler.toml` 里 `routes` 必须写在 `[[d1_databases]]` **之前**（TOML 归属规则）；必须绑自有域名（workers.dev 大陆不可用）。代码与验证脚本：`health-api-cf/`（`src/worker.js`、`schema.sql`、`scripts/test_ingest.mjs` 本地 mock 验证）。改代码后 `npx wrangler deploy` 约 10 秒生效。
+注意：`wrangler.toml` 里 `routes` 必须写在 `[[d1_databases]]` **之前**（TOML 归属规则）；必须绑自有域名（workers.dev 大陆不可用）。代码与验证脚本：`hae-api/`（`src/worker.js`、`schema.sql`、`scripts/test_ingest.mjs` 本地 mock 验证）。改代码后 `npx wrangler deploy` 约 10 秒生效。
 
 ## 7. 密钥与安全
 
-- 所有密钥仅存本机：`health-api-cf/keys.local.md`（WRITE_KEY 推送用 / READ_KEY 查询用 / DASH_TOKEN 仪表盘口令 / D1 database_id）
+- 所有密钥仅存本机：`hae-api/keys.local.md`（WRITE_KEY 推送用 / READ_KEY 查询用 / DASH_TOKEN 仪表盘口令 / D1 database_id）
 - **本文档不含密钥**。转交 READ_KEY 请走安全通道（密码管理器/当面），勿贴群聊、勿进代码仓库
 - 仪表盘：`https://hae.qiaclass.com/dashboard`，口令 = DASH_TOKEN（6 位数字），首次 `?t=<token>` 登录后 Cookie 记一年
 - 聊天窗口会把长 key 截断显示，复制用 `pbcopy` 全量粘贴

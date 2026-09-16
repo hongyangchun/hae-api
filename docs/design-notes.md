@@ -1,7 +1,7 @@
 # Health Auto Export → Cloudflare 全免费云方案 · 原理与配置笔记
 
 > 2026-09-03 搭建完成并全链路验证。零月费、无常驻进程、无局域网依赖。
-> 密钥与地址备忘：`health-api-cf/keys.local.md`
+> 密钥与地址备忘：`hae-api/keys.local.md`
 
 ---
 
@@ -77,7 +77,7 @@ workouts(id, name, day, start, end, duration_min, kcal, distance, avg_hr, max_hr
 
 ### Step 1 · Cloudflare 端（Mac 终端，一次性）
 ```bash
-cd health-api-cf
+cd hae-api
 npx wrangler login                                  # 浏览器点 Allow
 npx wrangler d1 create hae-health                   # 把输出的 database_id 填进 wrangler.toml
 npx wrangler d1 execute hae-health --remote --file=schema.sql
@@ -92,8 +92,13 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 - Type: REST API ｜ URL: `https://hae.qiaclass.com/api/data`
 - Header: `api-key` = WRITE_KEY
 - Data Type: Health Metrics ｜ Format: JSON
-- **Aggregate Data: 关闭**（关键！）
+- **Aggregate Data: 开启**，Aggregate Interval: **Days**
 - Batch Requests: 开
+
+> **2026-09-16 更正**：此处原写「关闭」，那是针对早期 HAE 版本的结论 —— 当时开启聚合会把日合计错误地做成分段平均（步数 9925 → 16）。
+> 服务端补上按天聚合（`aggregateMetric()` 对累计型求和）后，该 bug 的影响已被吸收：每天 1 点求和 = 原值，不会算错。
+> 而**关闭**聚合在 v10 下会让睡眠退化成分段碎片，被服务端准入门禁拒收，导致睡眠数据整段缺失。
+> **当前正确配置是「开启」**，完整论证见 [`deployment.md` 第 3.3 节](deployment.md#33-聚合数据开关必须搞清的一个坑)。
 
 **自动化 B —— 锻炼**：同上，Data Type 选 Workouts（聚合开关无所谓）
 
@@ -116,7 +121,8 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 
 ## 五、踩坑记录（血泪经验）
 
-1. **HAE 聚合语义错误（最重要）**：开启 Aggregate Days 后，活动热量 2970 kJ/天 只推来 0.234 kJ；步程 4.1 km/天 只来 0.016 km——它把"日合计"错误做成了"分段平均"。**结论：必须关聚合，服务端自己聚合。** Worker 内置检测：累计型指标若每天只来 1 个点会在响应里报警。
+1. **HAE 聚合语义错误（历史坑，现已由服务端吸收）**：早期版本开启 Aggregate Days 后，活动热量 2970 kJ/天 只推来 0.234 kJ；步程 4.1 km/天 只来 0.016 km——它把"日合计"错误做成了"分段平均"。当时结论是「关聚合、服务端自己算」。
+   **2026-09-16 复核**：服务端已有 `aggregateMetric()`，每天 1 点的输入经过求和仍是原值，所以现在可以放心开启聚合并获得完整的睡眠数据。Worker 里那条「请在自动化里关闭 Aggregate Data」的响应警告（`worker.js` 第 351 行）是这次修正前的遗留启发式判断，在推荐配置下会持续误报，**应视为噪音**。详见 [`deployment.md` 第 3.3 节](deployment.md#33-聚合数据开关必须搞清的一个坑)。
 2. **workers.dev 域名大陆被 DNS 污染**：iPhone 直连大概率失败，必须绑自有域名（Cloudflare 自定义域，免费）。
 3. **Save & Test 有迷惑性**：它测的是公开的 `/`，通过≠鉴权配置对。查询端点 401 要看数据源 header 是否配对。
 4. **401 排查**：十有八九是 key 复制被截断/带空格。用 `pbcopy` 把完整 key 放剪贴板再粘贴。
@@ -128,7 +134,7 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 
 ## 六、运维备忘
 
-- **文件**：代码 `health-api-cf/`｜密钥与口令 `health-api-cf/keys.local.md`｜Grafana 备用面板 `health-api-cf/grafana-dashboard.json`
+- **文件**：代码 `hae-api/`｜密钥与口令 `hae-api/keys.local.md`｜Grafana 备用面板 `hae-api/grafana-dashboard.json`
 - **域名**：`hae.qiaclass.com`｜**仪表盘**：`/dashboard`（裸地址，口令见 keys.local.md）｜**D1**：hae-health (id b91ee90f-e928-497c-b15a-5d5cd7d5f59b)
 - **改代码后**：`npx wrangler deploy`（10 秒生效）
 - **手动查数**：`curl -H "api-key: <READ_KEY>" "https://hae.qiaclass.com/api/query?name=step_count"`
