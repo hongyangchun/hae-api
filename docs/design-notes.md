@@ -212,8 +212,8 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 
 - **文件**：代码 `hae-api/`｜密钥与口令 `hae-api/keys.local.md`｜Grafana 备用面板 `hae-api/grafana-dashboard.json`
 - **域名**：`hae.qiaclass.com`｜**仪表盘**：`/dashboard`（裸地址，口令见 keys.local.md）｜**D1**：hae-health (id b91ee90f-e928-497c-b15a-5d5cd7d5f59b)
-- **改代码后**：`npx wrangler deploy`（10 秒生效）。本机已 `npm i -D wrangler` 装到仓库内
-  （`node_modules/.bin/wrangler`），不用再借别处的副本
+- **改代码后**：`npx wrangler deploy`（10 秒生效）。本机仓库里另装了 wrangler 可直接用
+  `node_modules/.bin/wrangler`（**未写进 package.json**，属本地便利工具，不影响 `npx` 路径）
 - **手动查数**：`curl -H "api-key: <READ_KEY>" "https://hae.qiaclass.com/api/query?name=step_count"`
 - **派生指标**：`curl -H "api-key: <READ_KEY>" "https://hae.qiaclass.com/api/query?name=vo2_max_est"`
   （带 `?hrmax=185` 可覆盖参考最大心率）
