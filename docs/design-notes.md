@@ -61,9 +61,20 @@ iPhone 侧的正确配置是**开启聚合**（Aggregate Interval = Days）。�
 ### 4. 数据模型（D1 / SQLite）
 ```
 metric_points(metric, date, slot, qty, units)   -- 一天一格点
-  slot: qty=普通 | avg/min/max=心率 | total/deep/rem/core/awake/inbed=睡眠
+  slot: qty=普通（含 resting_heart_rate / heart_rate_variability / walking_heart_rate_average）
+        | avg/min/max=仅 heart_rate
+        | total/deep/rem/core/unclassified/awake/inbed=睡眠
 workouts(id, name, day, start, end, duration_min, kcal, distance, avg_hr, max_hr, raw)
 ```
+
+**两条槽位不变量**（都曾因违反而出过"数据缺失"的假象，见第五节 10、11）：
+
+1. `avg/min/max` 三槽**只有** `heart_rate` 使用。名字里含 `heart_rate` 的其它指标
+   （`resting_heart_rate` / `heart_rate_variability` / `walking_heart_rate_average`）
+   每天只有一个标量，必须统一写 `qty`。判断规则收敛在 `isHrAggregate()` 一个函数里。
+2. 睡眠的 `total = deep + rem + core + unclassified`。`unclassified` 是 Apple 的
+   `asleepUnspecified`（手表没分成浅/深/REM 的那部分睡眠），必须单独成槽，
+   否则堆叠图永远画不满总时长。
 
 ### 5. 查询 API
 | 端点 | 用途 |
@@ -132,6 +143,9 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 7. **聊天界面会把长字符串截断成 `sk-d-3…ffd2`**：从消息里复制 token 会拿到残缺值。对策：pbcopy 进剪贴板、把 token 换短（现为 6 位数字口令）。
 8. **ECharts 重渲染必须先 dispose**：仪表盘切换天数范围时按钮曾重复追加、图表变空白——setRange 先 `innerHTML=''`，render 先遍历 `dispose()` 旧实例。
 9. **睡眠数据两个语义坑**：① 日期 = 醒来那天早晨（09-03 的点 = 9-2 晚的觉），查「昨晚」要取今天的点；② 白天会推来当日的残夜点（不足 1h、结构全零），仪表盘已过滤 `total>1`；某晚 1.4h 结构全零 = 手表没戴/没测，不是数据丢了。
+10. **「静息心率缺失」其实是入库槽位分裂**（2026-09-16 修）：`metricRows()` 用 `includes('heart_rate')`、`aggregateMetric()` 用 `=== 'heart_rate'`，同一个指标被写成两个槽 —— 08-29~09-03 那批 Mac 回填数据写进 `avg`，之后 iPhone 推送写进 `qty`。仪表盘读 `avg` 于是只剩 6 天（卡在 09-03），pulse 插件读 `qty` 反而有 18 天。同一份真实数据跑两条路径即可复现。修法：判断规则收敛到 `isHrAggregate()`，存量 `avg` 行用 `scripts/migrate-2026-09-16-heart-rate-slots.sql` 并入 `qty`。
+11. **「睡眠缺失」多数是 `unclassified` 被丢了**（2026-09-16 修）：`asleep` 字段以前只是 `totalSleep` 的兜底别名，于是 Apple 的「未分类睡眠」(asleepUnspecified) 从没入库。实测 2026-09-14 该字段为 0（当晚全部睡段都分类了），2026-09-10 则是 1.71h —— 差的正是堆叠图缺的那块。极端情况 09-01 整晚未分类（total 3.55 全在 unclassified），图表只剩一根 1.66h 的「清醒」柱，看起来像整晚没数据。**注意**：另有 09-13 整天无睡眠，那是源端当晚没有睡眠记录（iCloud 明文导出里同样没有 `sleep_analysis`），不是服务端丢弃 —— 不要照着"修"。
+12. **`parseHaeDate()` 对 HAE 原生时间戳全部解析失败**（2026-09-16 修）：`"2026-09-13 23:24:43 +0800"` 只把日期与时间之间的空格换成 `T`，结果 `"…23:24:43 +08:00"` 里时区前仍有空格，V8 判为 Invalid Date。日期因为 `dayKey()` 还有正则兜底所以一直没错，但**所有基于时间戳的时长计算都是废的**（分段睡眠各阶段时长、锻炼 duration 兜底、在床时长）。修法：先把时区前的空格并掉再换 `T`。改完用 509 个真实时间字段做过回归，日期输出零漂移。
 
 ## 六、运维备忘
 

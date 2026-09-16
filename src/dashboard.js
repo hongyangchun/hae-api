@@ -64,6 +64,10 @@ function get(u){return fetch(u,{headers:{'api-key':KEY}}).then(function(r){retur
 function load(n,e){return get('/api/query?name='+n+(e||'')+'&from='+from()+'&to='+to()).then(function(j){return j.points||[]}).catch(function(){return []})}
 function fmt(n,d){if(n==null||isNaN(n))return '--';return Number(n).toFixed(d==null?1:d)}
 function last(pts,k){for(var i=pts.length-1;i>=0;i--){var v=k?pts[i][k]:pts[i].qty;if(v!=null&&v!==0)return{v:v,d:pts[i].date}}return{v:null,d:''}}
+// 单值指标统一取标量：优先 qty，兼容历史数据里被误写成 avg 的槽
+function scalarize(pts){return pts.map(function(p){return{date:p.date,qty:(p.qty!=null?p.qty:p.avg)}})}
+// 未分类睡眠：Apple 的 asleepUnspecified。老数据没有该槽，用「总时长-已分类」推导
+function unclass(p){if(p.unclassified!=null)return p.unclassified;var s=(p.deep||0)+(p.rem||0)+(p.core||0);return p.total!=null?Math.max(0,Math.round((p.total-s)*1000)/1000):null}
 function chart(id){var el=document.getElementById(id);if(!el)return null;if(!CH[id]&&window.echarts)CH[id]=echarts.init(el);return CH[id]}
 function draw(id,title,pts,series,opts){
  var box=document.getElementById(id);if(!box)return;
@@ -88,8 +92,8 @@ function render(){
  var jobs=[
   load('step_count').then(function(p){P.step=p;return load('active_energy','&convert=kcal')}).then(function(p){P.ae=p}),
   load('sleep_analysis').then(function(p){P.sleep=p.filter(function(x){return x.total>1})}),
-  load('heart_rate').then(function(p){P.hr=p;return load('resting_heart_rate')}).then(function(p){P.rhr=p}),
-  load('heart_rate_variability').then(function(p){P.hrv=p;return load('weight_body_mass')}).then(function(p){P.wt=p}),
+  load('heart_rate').then(function(p){P.hr=p;return load('resting_heart_rate')}).then(function(p){P.rhr=scalarize(p)}),
+  load('heart_rate_variability').then(function(p){P.hrv=scalarize(p);return load('weight_body_mass')}).then(function(p){P.wt=p}),
   load('blood_oxygen_saturation').then(function(p){P.spo2=p;return load('walking_running_distance')}).then(function(p){P.dist=p}),
   load('apple_exercise_time').then(function(p){P.ex=p}),
   get('/api/workouts?from='+from()+'&to='+to()).then(function(j){P.wk=j.workouts||[]}).catch(function(){P.wk=[]})
@@ -98,7 +102,7 @@ function render(){
   var cs=[['步数',fmt(last(P.step).v,0),'步',last(P.step).d],
    ['活动热量',fmt(last(P.ae).v,0),'kcal',last(P.ae).d],
    ['睡眠',fmt(last(P.sleep).v!=null?last(P.sleep).v:last(P.sleep,'total'),1),'小时',last(P.sleep).d||last(P.sleep,'total').d],
-   ['静息心率',fmt(last(P.rhr,'avg').v,0),'bpm',last(P.rhr,'avg').d],
+   ['静息心率',fmt(last(P.rhr).v,0),'bpm',last(P.rhr).d],
    ['锻炼环',fmt(last(P.ex).v,0),'分钟',last(P.ex).d],
    ['体重',fmt(last(P.wt).v,1),'kg',last(P.wt).d]];
   cs.forEach(function(c){addCard(c[0],c[1],c[2],c[3])});
@@ -108,13 +112,14 @@ function render(){
    {name:'深睡',type:'bar',data:P.sleep.map(function(p){return p.deep}),color:'#8957e5',extra:{stack:'s'}},
    {name:'REM',type:'bar',data:P.sleep.map(function(p){return p.rem}),color:'#bc8cff',extra:{stack:'s'}},
    {name:'核心',type:'bar',data:P.sleep.map(function(p){return p.core}),color:'#58a6ff',extra:{stack:'s'}},
+   {name:'未分类',type:'bar',data:P.sleep.map(unclass),color:'#4d5566',extra:{stack:'s'}},
    {name:'清醒',type:'bar',data:P.sleep.map(function(p){return p.awake}),color:'#6e7681',extra:{stack:'s'}}]);
   draw('c4','心率 min/avg/max',P.hr,[
    {name:'min',data:P.hr.map(function(p){return p.min}),color:'#3fb950'},
    {name:'avg',data:P.hr.map(function(p){return p.avg}),color:'#e3b341'},
    {name:'max',data:P.hr.map(function(p){return p.max}),color:'#f85149'}]);
-  draw('c5','静息心率 (bpm)',P.rhr,[{name:'bpm',data:P.rhr.map(function(p){return p.avg}),color:'#f85149'}]);
-  draw('c6','HRV (ms)',P.hrv,[{name:'ms',data:P.hrv.map(function(p){return p.avg}),color:'#39d2c0'}]);
+  draw('c5','静息心率 (bpm)',P.rhr,[{name:'bpm',data:P.rhr.map(function(p){return p.qty}),color:'#f85149'}]);
+  draw('c6','HRV (ms)',P.hrv,[{name:'ms',data:P.hrv.map(function(p){return p.qty}),color:'#39d2c0'}]);
   draw('c7','体重 (kg)',P.wt,[{name:'kg',data:P.wt.map(function(p){return p.qty}),color:'#d29922',extra:{symbolSize:6}}]);
   draw('c8','血氧 (%)',P.spo2,[{name:'%',data:P.spo2.map(function(p){return p.qty}),color:'#58a6ff'}],{y:{min:85,max:100}});
   draw('c9','步行+跑步距离 (km)',P.dist,[{name:'km',type:'bar',data:P.dist.map(function(p){return p.qty}),color:'#7ee787'}]);

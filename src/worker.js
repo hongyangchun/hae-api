@@ -22,7 +22,12 @@ const KJ_TO_KCAL = 4.184;
 function parseHaeDate(v) {
   if (!v) return null;
   // "2026-09-02 00:00:00 +0800" -> "2026-09-02T00:00:00+08:00"
-  const s = String(v).trim().replace(' ', 'T').replace(/([+-]\d{2})(\d{2})$/, '$1:$2');
+  // 注意：必须先把时区前的空格去掉。只把日期与时间之间的空格换成 T 会得到
+  // "2026-09-02T00:00:00 +08:00"，V8 视为 Invalid Date —— 之前因此所有带时区
+  // 的时间戳都解析失败（日期靠 dayKey 的正则兜底才没出错，但时长计算全废）。
+  const s = String(v).trim()
+    .replace(/\s+([+-]\d{2}):?(\d{2})$/, '$1:$2')
+    .replace(' ', 'T');
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -63,14 +68,50 @@ const SUM_METRICS = new Set([
   'time_in_daylight', 'dietary_water', 'mindful_minutes', 'handwashing',
 ]);
 
-const SLEEP_SLOTS = [
-  ['total', ['totalSleep', 'asleep']],
-  ['deep', ['deep']],
-  ['rem', ['rem']],
-  ['core', ['core']],
-  ['awake', ['awake']],
-  ['inbed', ['inBed']],
-];
+/* 睡眠槽位（汇总式睡眠点，单位小时）
+ *   total        睡眠总时长（HAE 的 totalSleep，不含清醒）
+ *   deep/rem/core 三类已分类睡眠
+ *   unclassified Apple 的「未分类睡眠」(asleepUnspecified)
+ *   awake/inbed  清醒、在床
+ *
+ * 为什么 unclassified 要单独成槽：它以前只作为 totalSleep 的兜底别名存在，
+ * 于是「深睡+REM+核心」堆叠永远小于总时长，图表看起来像缺数据。
+ * 实测 2026-09-14：totalSleep 6.4039 = deep 0.5829+rem 1.0659+core 4.7551，asleep = 0；
+ * 而 2026-09-10：total 6.07 但分类仅 4.36 —— 差的 1.71 小时全在 unclassified 里被丢掉了。
+ *
+ * inbed 说明：HAE 的 inBed 字段实测恒为 0，真实在床时长要用 inBedEnd - inBedStart 补算。
+ */
+function sleepSlotValues(p) {
+  const deep = numOrNull(p.deep), rem = numOrNull(p.rem), core = numOrNull(p.core);
+  const awake = numOrNull(p.awake);
+  const asleep = numOrNull(p.asleep); // Apple: asleepUnspecified
+
+  let total = numOrNull(p.totalSleep);
+  if (total === null) {
+    const parts = [deep, rem, core, asleep].filter((v) => v !== null);
+    total = parts.length ? parts.reduce((a, b) => a + b, 0) : null;
+  }
+
+  // 优先用 Apple 给的 asleep；老数据/缺字段时用「总时长 - 已分类」推导
+  let unclassified = asleep;
+  if (unclassified === null && total !== null && (deep !== null || rem !== null || core !== null))
+    unclassified = total - (deep || 0) - (rem || 0) - (core || 0);
+  if (unclassified !== null) unclassified = Math.max(0, Math.round(unclassified * 1000) / 1000);
+
+  let inbed = numOrNull(p.inBed);
+  if (!inbed) {
+    const s = parseHaeDate(p.inBedStart), e = parseHaeDate(p.inBedEnd);
+    if (s && e && e > s) inbed = Math.round(((e - s) / 3600000) * 1000) / 1000;
+  }
+
+  return { total, deep, rem, core, awake, unclassified, inbed };
+}
+
+// 只有聚合心率 heart_rate 使用 avg/min/max 三槽；其余含 "heart_rate" 字样的指标
+// （resting_heart_rate / heart_rate_variability / walking_heart_rate_average）都是
+// 每天一个标量，必须统一写 'qty' 槽。曾因 metricRows 用 includes、aggregateMetric 用
+// 全等，同一天被写成两个槽，仪表盘读 avg 只有 6 天数据、报表读 qty 有 19 天。
+const isHrAggregate = (name) => name === 'heart_rate';
 
 // 新版 HAE 分段式睡眠点：{start, end, value: "睡眠时长"|"核心"|"深度"|"快速眼动"|"清醒"...}
 // value 是本地化字符串（中文/英文都可能），映射到库内 slot
@@ -107,12 +148,8 @@ export function metricRows(metric) {
         const v = s && e ? (e - s) / 3600000 : numOrNull(p.qty);
         if (v !== null) rows.push({ metric: name, date, slot: sleepStageSlot(stageRaw), qty: Math.round(v * 1000) / 1000, units: units || 'hr' });
       } else {
-        for (const [slot, keys] of SLEEP_SLOTS) {
-          for (const k of keys) {
-            const v = numOrNull(p[k]);
-            if (v !== null) { rows.push({ metric: name, date, slot, qty: v, units: units || 'hr' }); break; }
-          }
-        }
+        for (const [slot, v] of Object.entries(sleepSlotValues(p)))
+          if (v !== null) rows.push({ metric: name, date, slot, qty: v, units: units || 'hr' });
       }
       continue;
     }
@@ -120,14 +157,15 @@ export function metricRows(metric) {
     const date = dayKey(p.date || p.startDate || p.sleepStart);
     if (!date) continue;
 
-    if (name.includes('heart_rate')) {
+    if (isHrAggregate(name)) {
       // 小时统计点带 Avg/Min/Max；日聚合后同样适用
       const a = numOrNull(p.Avg), mi = numOrNull(p.Min), ma = numOrNull(p.Max), q = numOrNull(p.qty);
+      const fallback = a ?? mi ?? ma ?? q; // 只有 qty 时也归到 avg，保持该指标的槽位语义
       if (a !== null) rows.push({ metric: name, date, slot: 'avg', qty: a, units });
       if (mi !== null) rows.push({ metric: name, date, slot: 'min', qty: mi, units });
       if (ma !== null) rows.push({ metric: name, date, slot: 'max', qty: ma, units });
-      if (a === null && mi === null && ma === null && q !== null)
-        rows.push({ metric: name, date, slot: 'avg', qty: q, units });
+      if (a === null && mi === null && ma === null && fallback !== null)
+        rows.push({ metric: name, date, slot: 'avg', qty: fallback, units });
       continue;
     }
 
@@ -165,13 +203,9 @@ export function aggregateMetric(metric) {
           day.slots.set(slot, acc);
         }
       } else {
-        // 旧式汇总点：每键一行（后推覆盖，保留原语义）
-        for (const [slot, keys] of SLEEP_SLOTS) {
-          for (const k of keys) {
-            const v = numOrNull(p[k]);
-            if (v !== null) { day.slots.set(slot, { sum: v, count: 1, min: v, max: v }); break; }
-          }
-        }
+        // 汇总式点（HAE 开「聚合数据」后的日常推送）：值本身已是当天合计，直接覆盖
+        for (const [slot, v] of Object.entries(sleepSlotValues(p)))
+          if (v !== null) day.slots.set(slot, { sum: v, count: 1, min: v, max: v });
       }
       continue;
     }
@@ -181,7 +215,7 @@ export function aggregateMetric(metric) {
     let day = byDay.get(date);
     if (!day) { day = { slots: new Map() }; byDay.set(date, day); }
 
-    if (name === 'heart_rate') {
+    if (isHrAggregate(name)) {
       for (const [slot, key] of [['avg', 'Avg'], ['min', 'Min'], ['max', 'Max']]) {
         const v = numOrNull(p[key]);
         if (v === null) continue;
