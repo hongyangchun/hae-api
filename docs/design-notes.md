@@ -89,7 +89,7 @@ workouts(id, name, day, start, end, duration_min, kcal, distance, avg_hr, max_hr
 | `GET /api/query?name=X&from=&to=&convert=` | 某指标的时间序列 |
 | `GET /api/query?name=vo2_max_est[&hrmax=]` | 心肺耐力估算（派生，不落库） |
 | `GET /api/workouts?from=&to=` | 锻炼记录 |
-| `POST /api/data` | HAE 推送入口（`preaggregated:true` 支持 Mac 本地预聚合回填） |
+| `POST /api/data` | HAE 推送入口。`preaggregated:true` 是**客户端自报**的标记，服务端不据此改变聚合方式（见踩坑 17） |
 
 ### 6. 心肺耐力（VO2max）估算
 
@@ -402,6 +402,44 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
     排查入口是 `/api/metrics` 的 `last_day`，但**要记住它每天会变**，只能当「此刻源端有没有」的快照。
 
 
+17. **`preaggregated` 是一条不该存在的信任边界**（2026-09-17 修）：`POST /api/data` 曾经在
+    `data.preaggregated === true` 时走 `metricRows()` **原样逐条入库**。这个标记完全由客户端自报、
+    服务端不做任何校验 —— 而 `metricRows()` 对同一天的多条**不聚合**，只靠主键冲突互相覆盖。
+    拿 iCloud 真实导出文件实测，把分段数据误标成 preaggregated：`physical_effort` 从 2.533 变成 1
+    （**-60.5%**）、`walking_speed` 3.729 → 2.448（-34.4%）、`walking_step_length` 60.583 → 44，
+    单指标一次丢 63 个分段，而接口照样返回 `200 {ok:true}`。
+    修法不是"加校验"，而是**取消分流**：`aggregateMetric()` 对「一天一行」的输入结果完全等价
+    （累计型求和退化成该值本身、标量型平均退化成该值、睡眠汇总式点直接覆盖），统一走它 ——
+    少一条路径，也就少一条信任边界。`metricRows()` 保留导出仅为兼容外部调用方，ingest 不再使用。
+    同一条路径还**不做任何取整**，于是 HAE 的原始浮点在库里留下 8 个超精度值
+    （`3.766666571299235`、`0.29255080223083496`、`35.63467025756836` …），全部集中在
+    2026-08-28/08-29 —— 那两天正是 Mac 端回填导入的，**指纹完全对得上**。
+    这类残留没法靠"重推一次"自愈（HAE 只推当天，历史天永远轮不到 UPSERT），
+    已由 `scripts/migrate-2026-09-17-round-precision.sql` 收敛（21 行，幂等）。
+18. **同一段上报链路上还有 7 处「不会报错」的缺陷**（2026-09-17 全栈巡检一次性修）。
+    共同点是：**接口返回 200、日志干净、没有任何征兆**，只能靠边界用例逼出来 ——
+    已固化为 `scripts/verify_ingest.mjs`（mock D1 接住所有写入语句，74 条断言，离线、不碰生产）：
+
+    | 缺陷 | 症状 | 修法 |
+    |---|---|---|
+    | `workoutRow` 里 `w?.heartRate.max` **漏了 `?.`**（上行 `.avg` 有） | 一条既无 `maxHeartRate` 又无 `heartRate` 的锻炼（App 手动记录 / 没戴表）→ 抛异常 → **整个 ingest 500，当天全部指标一起丢**。线上没炸只是因为 HAE 目前每条都带 `heartRate` | 补 `?.`；并加用例锁定「一条坏锻炼不能拖垮整单」 |
+    | `aggregateMetric()` 的 `isHrAggregate` 分支**只认大写 `Avg/Min/Max`**，没有 `qty` 兜底（`metricRows()` 里反而有 `a ?? mi ?? ma ?? q`） | HAE 一旦改配置只发 `qty`，心率**整段静默消失**（实测输入 2 个点 → 输出 0 行），而不是降级成均值 | 补 qty 兜底落到 `avg` 槽，两条路径行为对齐 |
+    | `workoutRow` 的 `duration_min` / `kcal` **不取整**（`avg_hr`/`max_hr` 却 round 了） | `71.96487963199615` 分钟、`361.36192551290105` kcal 一路进 DB 和 API 响应 | 收敛到 1 位小数；存量行同上由迁移脚本收敛 |
+    | 能耗写成 `activeEnergyBurned \|\| activeEnergy \|\| totalEnergy`，而 **`activeEnergy` 是数组** | 数组 truthy 会短路掉后面的 `totalEnergy`，而 `energy?.qty` 在数组上取不到值 → kcal 静默变 `null`（实测一条锻炼的 totalEnergy 1669.9 kJ 就这样丢了） | 改成依次试 `qty`；只剩数组时对其求和（比 totalEnergy 更准） |
+    | `scalar(r.metric, …)` / `scalar(r.units, …)` **漏传候选键** | 字段是对象时（新版 HAE 偶发）走 JSON 兜底 → 写出 `{"value":"step_count"}` **这种指标名**，等于往库里塞垃圾指标 | 在**解析的源头**就用 `NAME_PICK` / `UNIT_PICK` 取字符串。注意 `units` 的候选键曾漏掉 `value`，于是单位被写成 `{"value":"count"}` |
+    | `inbed` 补算失败时**留 0** | 「在床 0 小时」物理上不可能，却写进了库 —— 线上 16/19 天是 0。任何 `睡眠效率 = total / inbed` 的下游计算都会除零或得 0% | 补算失败写 `null`（干脆不写这个槽） |
+    | `KJ_TO_KCAL = 4.184` **名字与方向相反** | 4.184 是 kcal→kJ；KJ→kcal 才是 0.239。健康数据里差 4 倍不会抛错，只会让热量看起来离谱 | 改名 `KJ_PER_KCAL`；并把 `handleQuery` 里硬编码的 `1 / 4.184` 换成常量 |
+
+    方法论上值得记一笔：这 7 处的共同检出手段是**「拿真实导出数据喂两条路径对拍 + 穷举边界输入」**，
+    而不是读代码。比如心率那条，是构造「只有 qty 的点」才发现的 —— 线上数据永远是带 `Avg/Min/Max` 的
+    聚合形状，读代码时两个分支看起来都对。
+19. **派生指标的窗口默认值必须落在今天**（2026-09-17 修）：`vo2_max_est` 的窗口语义是
+    「从 `to` 往回数 90 天」，而 `handleQuery` 给 `to` 的缺省值是 `2099-12-31` —— 于是
+    **裸调用 `/api/query?name=vo2_max_est` 永远返回「参考最大心率不足，无法估算」**，
+    因为查询区间落在未来。仪表盘和 pulse 都显式传了 `to` 所以一直没暴露，但手工调试和文档示例一定踩。
+    修法：`name === 'vo2_max_est'` 时 `to` 缺省取 `shanghaiDay(new Date())`（`from` 保持 `2000-01-01`，
+    不传 `from` 仍返回全部可算的点）。
+
 ## 七、运维备忘
 
 - **文件**：代码 `hae-api/`｜密钥与口令 `hae-api/keys.local.md`｜Grafana 备用面板 `hae-api/grafana-dashboard.json`
@@ -414,3 +452,18 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
 - **免费额度**：Worker 10 万请求/天、D1 5GB 存储（年度按天数据仅几 MB）——个人用量绰绰有余
 - **与早报管线并行**：iCloud JSON → `parse_health_export.py` → 每天 08:00 简报，不受本方案影响
 - **已知小缺口**：08-29 部分指标缺数据（HealthKit 当天来源问题，非链路问题）；今天的行在次日自动推送后覆盖为完整值
+- **`sleep_analysis.inbed` 有 16 天是 0**：补算失败时写了 0 而非 null 的历史遗留（代码已修，**存量不改** ——
+  原始 payload 没留档，无法判断真实在床时长，回填只会是猜测）。任何要算「睡眠效率」的下游请把这个 0 当缺失值过滤掉。
+- **全栈体检怎么做**（2026-09-17 首次跑，结论是「数据层干净、代码层 10 个缺陷」）：
+  ```bash
+  # ① 指标完整性：把 HAE 手机端配置的指标清单转 snake_case 后逐个探 API
+  #    配置在 ~/Library/Mobile Documents/iCloud~com~ifunography~HealthExport/Documents/Automations/*.json
+  #    （找 exportDestination=restApi && includeHealthMetrics 那条，112 项里 79 项本来就无数据）
+  #    只看 DB 无法知道源端还有什么 —— 这是回答「有没有指标丢了」的唯一可靠办法
+  # ② 逐指标扫「数值包络 + 日期缺口」（/api/query 全量拉）
+  # ③ 两个不变量：睡眠 total = deep+rem+core+unclassified、heart_rate min ≤ avg ≤ max
+  # ④ 上报链路：node scripts/verify_ingest.mjs
+  # ⑤ 渲染链路：node scripts/verify_dashboard_cards.mjs
+  ```
+  注意 HAE 的 `AutoSync/HealthMetrics/<指标>/<日期>.hae` 是**加密二进制**，`data:[]` 的空记录也占上百字节，
+  不能靠文件大小判断"有没有数据"，只能靠 API 探测。

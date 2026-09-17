@@ -66,10 +66,20 @@ Automations → New Automation（健康指标、锻炼各建一个）：
 ## 本地验证
 
 ```bash
-node scripts/test_ingest.mjs            # 用 iCloud 里真实导出数据跑解析+mock 入库
+node scripts/verify_ingest.mjs          # 上报端边界用例（mock D1，74 条断言，离线不碰生产）
+node scripts/test_ingest.mjs            # 用 iCloud 里真实导出数据跑解析+mock 入库（基准核对）
 node scripts/verify_dashboard_cards.mjs # 卡片渲染断言（桩 DOM 跑真脚本，见下）
 npx wrangler dev                        # 本地起 Worker，curl POST /api/data 实测
 ```
+
+`verify_ingest.mjs` 把上报端（`POST /api/data`）的每条分支都钉死：累计型求和 / 标量型平均 /
+心率三槽 / 睡眠分段式 vs 汇总式 / `preaggregated` / 鉴权 / 非法输入 / 幂等 / 分片边界。
+它用 mock D1 接住所有写入语句，**不联网、不碰生产数据**，随时可跑。
+
+为什么需要它：这条链路上的缺陷几乎都是「接口返回 `200 {ok:true}`、日志干净」，
+要几天后看图表才发现不对。2026-09-17 一次巡检就在这里挖出 7 处（一条缺 `?.` 的锻炼
+能让**当天全部指标**跟着 500 丢掉的、心率只发 `qty` 时整段静默消失的、`preaggregated`
+误标导致 -60.5% 偏差的……详见 `docs/design-notes.md` 踩坑 17–19）。
 
 `verify_dashboard_cards.mjs` 用桩 `document` / 桩 `echarts` 在 Node 里跑仪表盘真正的那段
 内联脚本，然后读**实际渲染出来的文案**做断言。仪表盘的 bug 基本都是「接口 200、页面不报错、

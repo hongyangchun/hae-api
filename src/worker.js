@@ -17,7 +17,10 @@
 import { dashSig, loginHTML, dashboardHTML } from './dashboard.js';
 
 const TZ = 'Asia/Shanghai';
-const KJ_TO_KCAL = 4.184;
+/** kcal → kJ 的换算系数（1 kcal = 4.184 kJ）。方向提醒：**kJ / 4.184 = kcal**。
+ *  旧名 KJ_TO_KCAL 与实际方向相反（KJ→kcal 应该是 0.239），很容易让后来人乘错方向；
+ *  而健康数据里差 4 倍不会抛错，只会让热量看起来离谱。 */
+const KJ_PER_KCAL = 4.184;
 
 /* ---------- 日期工具 ---------- */
 
@@ -167,6 +170,14 @@ const scalar = (v, pick = []) => {
   return v;
 };
 
+/** 指标名字段的候选键。metric.name 在新版 HAE 里可能是对象（如 {value:'Step Count'}），
+ *  必须在**解析的源头**用 scalar 取出字符串 —— 否则会一路传到写入时被 JSON.stringify
+ *  成 `{"value":"step_count"}` 这种指标名，等于往库里塞一个垃圾指标。 */
+const NAME_PICK = ['name', 'metric', 'value', 'key', 'text'];
+/** units 同理。曾漏掉 'value'，导致 units 被写成 `{"value":"count"}` 字符串 ——
+ *  数值不受影响，但单位列变成一个 JSON 片段，任何按 units 分支的处理都会失灵。 */
+const UNIT_PICK = ['units', 'key', 'symbol', 'value', 'text'];
+
 /* ---------- 指标解析 ---------- */
 
 // 累计型指标：一天的正确值 = 各分段之和（HAE 自带聚合会把它们错误地平均，所以必须在服务端求和）
@@ -207,10 +218,14 @@ function sleepSlotValues(p) {
     unclassified = total - (deep || 0) - (rem || 0) - (core || 0);
   if (unclassified !== null) unclassified = Math.max(0, Math.round(unclassified * 1000) / 1000);
 
+  // inBed 补算：HAE 的 inBed 字段实测恒为 0（真实在床时长要用 inBedEnd - inBedStart 算）。
+  // **补算失败必须写 null，不能留 0** —— 「在床 0 小时」物理上不可能，写进去会让任何
+  // 「睡眠效率 = total / inbed」的下游计算除零或得出 0%。线上因此有 16/19 天的 inbed
+  // 是 0（09-15 起 HAE 才开始给真值）。
   let inbed = numOrNull(p.inBed);
   if (!inbed) {
     const s = parseHaeDate(p.inBedStart), e = parseHaeDate(p.inBedEnd);
-    if (s && e && e > s) inbed = Math.round(((e - s) / 3600000) * 1000) / 1000;
+    inbed = (s && e && e > s) ? Math.round(((e - s) / 3600000) * 1000) / 1000 : null;
   }
 
   return { total, deep, rem, core, awake, unclassified, inbed };
@@ -239,10 +254,14 @@ function sleepPointDate(p) {
   return dayKey(p.endDate || p.end || p.date || p.startDate || p.sleepStart);
 }
 
-/** 把一条 HAE metric 拆成数据行 { metric, date, slot, qty, units } */
+/** 把一条 HAE metric 原样拆成数据行 { metric, date, slot, qty, units }。
+ *
+ *  ⚠️ **ingest 已不再走这里**（原因见 handleIngest 里 toRows 的注释）：它对同一天的
+ *  多条不做聚合，靠主键冲突互相覆盖，只在"输入确实已是每天一行"时才对，而那个前提
+ *  是客户端自报的、不可信。保留导出仅为了兼容外部调用方。 */
 export function metricRows(metric) {
-  const name = metric?.name || 'unknown';
-  const units = metric?.units || '';
+  const name = scalar(metric?.name, NAME_PICK) || 'unknown';
+  const units = scalar(metric?.units, UNIT_PICK) || '';
   const rows = [];
   for (const p of Array.isArray(metric?.data) ? metric.data : []) {
     if (!p || typeof p !== 'object') continue;
@@ -287,8 +306,8 @@ export function metricRows(metric) {
 /** 把一条 metric 的原始分段聚合成"每天一行":
  *  累计型→求和；heart_rate(Avg/Min/Max)→均值/最小/最大；其余→平均；睡眠→直接取值 */
 export function aggregateMetric(metric) {
-  const name = metric?.name || 'unknown';
-  const units = metric?.units || '';
+  const name = scalar(metric?.name, NAME_PICK) || 'unknown';
+  const units = scalar(metric?.units, UNIT_PICK) || '';
   const isSum = SUM_METRICS.has(name);
   const byDay = new Map(); // date -> { slots: Map<slot, {sum,count,min,max}> }
   for (const p of Array.isArray(metric?.data) ? metric.data : []) {
@@ -325,8 +344,20 @@ export function aggregateMetric(metric) {
     if (!day) { day = { slots: new Map() }; byDay.set(date, day); }
 
     if (isHrAggregate(name)) {
-      for (const [slot, key] of [['avg', 'Avg'], ['min', 'Min'], ['max', 'Max']]) {
-        const v = numOrNull(p[key]);
+      const a = numOrNull(p.Avg), mi = numOrNull(p.Min), ma = numOrNull(p.Max);
+      if (a === null && mi === null && ma === null) {
+        // 只有 qty 的心率点（HAE 关掉聚合、或换了聚合粒度时发的形状）也必须落到 avg 槽。
+        // metricRows 一直有这层 `a ?? mi ?? ma ?? q` 兜底，aggregateMetric 漏了 —— 一旦
+        // HAE 改配置，心率会**整段静默消失**（实测输入 2 个点 → 输出 0 行），而不是降级。
+        const q = numOrNull(p.qty);
+        if (q !== null) {
+          const acc = day.slots.get('avg') || { sum: 0, count: 0, min: Infinity, max: -Infinity };
+          acc.sum += q; acc.count++; acc.min = Math.min(acc.min, q); acc.max = Math.max(acc.max, q);
+          day.slots.set('avg', acc);
+        }
+        continue;
+      }
+      for (const [slot, v] of [['avg', a], ['min', mi], ['max', ma]]) {
         if (v === null) continue;
         const acc = day.slots.get(slot) || { sum: 0, count: 0, min: Infinity, max: -Infinity };
         acc.sum += v; acc.count++; acc.min = Math.min(acc.min, v); acc.max = Math.max(acc.max, v);
@@ -368,24 +399,42 @@ export function workoutRow(w) {
   const endD = parseHaeDate(end);
   if (dur === null && startD && endD) dur = (endD - startD) / 1000;
 
-  const energy = w?.activeEnergyBurned || w?.activeEnergy || w?.totalEnergy;
-  let kcal = numOrNull(energy?.qty);
-  if (kcal !== null && String(energy?.units || '').toLowerCase().startsWith('kj'))
-    kcal = kcal / KJ_TO_KCAL;
+  // 能耗候选：activeEnergyBurned（HAE 给的一天总量）→ totalEnergy → activeEnergy。
+  // **不能写成 `a || b || c`**：activeEnergy 是**逐分钟点的数组**（truthy），会让它
+  // 短路掉后面的 totalEnergy 兜底，而 `energy?.qty` 在数组上取不到值 → kcal 静默变
+  // null（实测一条锻炼的 totalEnergy 1669.9 kJ 就这样被丢掉了）。
+  let kcal = null, energyUnits = null;
+  for (const cand of [w?.activeEnergyBurned, w?.totalEnergy]) {
+    const v = numOrNull(cand?.qty);
+    if (v !== null) { kcal = v; energyUnits = cand?.units; break; }
+  }
+  if (kcal === null && Array.isArray(w?.activeEnergy)) {
+    const sum = w.activeEnergy.reduce((a, p) => a + (numOrNull(p?.qty) ?? 0), 0);
+    if (sum > 0) { kcal = sum; energyUnits = w.activeEnergy[0]?.units; }
+  }
+  if (kcal !== null && String(energyUnits || '').toLowerCase().startsWith('kj'))
+    kcal = kcal / KJ_PER_KCAL;
 
   let avgHr = numOrNull(w?.avgHeartRate?.qty);
   let maxHr = numOrNull(w?.maxHeartRate?.qty);
+  // 两处都必须可选链。maxHeartRate 那行曾经漏了 `?.`，于是「既无 maxHeartRate 又无
+  // heartRate」的锻炼（App 里手动记录、或没戴表的那次）会让 workoutRow 抛异常 ——
+  // 而它在整个 ingest 的 try 里，**一条坏锻炼会连带当天全部指标一起 500 丢掉**。
+  // 线上没炸只是因为 HAE 目前每条都带 heartRate，属于侥幸。
   if (avgHr === null && w?.heartRate?.avg) avgHr = numOrNull(w.heartRate.avg.qty);
-  if (maxHr === null && w?.heartRate.max) maxHr = numOrNull(w.heartRate.max.qty);
+  if (maxHr === null && w?.heartRate?.max) maxHr = numOrNull(w.heartRate.max.qty);
   if (avgHr !== null) avgHr = Math.round(avgHr * 10) / 10;
   if (maxHr !== null) maxHr = Math.round(maxHr * 10) / 10;
 
   return {
     id, name, day: dayKey(start), start, end,
-    duration_min: dur === null ? null : dur / 60,
-    kcal,
+    // 取整到 1 位小数。HAE 的 duration 是浮点秒（如 3915.673400044441），不收敛就会把
+    // 71.96487963199615 分钟、361.36192551290105 kcal 一路带进 DB 和 API 响应。
+    // avg_hr/max_hr 早就 round 了，这两个漏掉属于同一函数内的不一致。
+    duration_min: dur === null ? null : Math.round((dur / 60) * 10) / 10,
+    kcal: kcal === null ? null : Math.round(kcal * 10) / 10,
     distance: numOrNull(w?.distance?.qty),
-    distance_units: scalar(w?.distance?.units, ['units', 'key', 'symbol']),
+    distance_units: scalar(w?.distance?.units, UNIT_PICK),
     avg_hr: avgHr, max_hr: maxHr,
     source: scalar(w?.source, ['name', 'value', 'key', 'source']),
     raw: JSON.stringify(w),
@@ -433,14 +482,23 @@ export async function handleIngest(request, env) {
 
   const stmts = [];
   let metricRowCount = 0;
-  const preAggregated = data?.preaggregated === true; // Mac 端本地回填：已是"每天一行"，直接入库
-  const toRows = preAggregated ? metricRows : aggregateMetric;
+  // 曾经按 `data.preaggregated === true` 分流到 metricRows（原样逐条入库），已取消。
+  // preaggregated 是**客户端自报**的，服务端全盘信任它太危险：一旦 Mac 端回填时误标
+  // （把分段数据标成"已是每天一行"），metricRows 会让同一天的多条互相覆盖，静默丢数。
+  // 拿 iCloud 真实导出文件实测：physical_effort 该 2.533 被写成 1（-60.5%）、
+  // walking_speed 该 3.729 写成 2.448（-34.4%），单指标一次丢 63 个分段，接口仍返回 200。
+  // aggregateMetric 对"一天一行"的输入结果完全等价（求和/平均退化成该值本身、睡眠
+  // 汇总式点直接覆盖），所以统一走它 —— 保住正确性，同时消掉这条信任边界。
+  const toRows = aggregateMetric;
   const METRIC_UPSERT = `INSERT INTO metric_points (metric, date, slot, qty, units)
     VALUES (?1, ?2, ?3, ?4, ?5)
     ON CONFLICT(metric, date, slot) DO UPDATE SET qty = excluded.qty, units = excluded.units`;
   for (const m of metrics)
     for (const r of toRows(m)) {
-      stmts.push(env.DB.prepare(METRIC_UPSERT).bind(scalar(r.metric), scalar(r.date), scalar(r.slot), scalar(r.qty), scalar(r.units, ['units', 'key', 'symbol'])));
+      stmts.push(env.DB.prepare(METRIC_UPSERT).bind(
+        scalar(r.metric, NAME_PICK), scalar(r.date, ['date', 'value', 'key']),
+        scalar(r.slot, ['slot', 'value', 'key']), scalar(r.qty),
+        scalar(r.units, UNIT_PICK)));
       metricRowCount++;
     }
 
@@ -505,14 +563,22 @@ async function handleQuery(url, env) {
   if (!name) return json({ error: 'missing ?name=' }, 400);
   const from = url.searchParams.get('from') || '2000-01-01';
   const to = url.searchParams.get('to') || '2099-12-31';
-  if (name === 'vo2_max_est') return handleVo2MaxEst(url, env, from, to); // 派生指标：读时计算
+  if (name === 'vo2_max_est') {
+    // 派生指标的窗口语义是「从 to 往回数 N 天」，所以 to 的缺省值必须落在**今天**。
+    // 沿用下面普通指标的 2099-12-31 会把 90 天窗口算到未来，HRmax 的查询区间落空，
+    // 于是裸调用 /api/query?name=vo2_max_est 永远返回「参考最大心率不足，无法估算」。
+    // （仪表盘与 pulse 都显式传了 to，所以之前没暴露 —— 但文档示例和手工调试一定踩。）
+    // 只动 to，from 的缺省值保持 '2000-01-01'（不传 from 时仍返回全部可算的点）。
+    const vto = url.searchParams.get('to') || shanghaiDay(new Date());
+    return handleVo2MaxEst(url, env, from, vto);
+  }
   const convert = url.searchParams.get('convert'); // kcal: kJ→kcal, km: m→km
   const { results } = await env.DB.prepare(
     `SELECT date, slot, qty, units FROM metric_points
      WHERE metric = ?1 AND date >= ?2 AND date <= ?3 ORDER BY date`,
   ).bind(name, from, to).all();
 
-  const factor = convert === 'kcal' ? 1 / 4.184 : convert === 'km' ? 1 / 1000 : 1;
+  const factor = convert === 'kcal' ? 1 / KJ_PER_KCAL : convert === 'km' ? 1 / 1000 : 1;
   const byDay = new Map();
   let units = '';
   for (const r of results) {
