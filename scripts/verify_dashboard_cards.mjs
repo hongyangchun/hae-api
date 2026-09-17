@@ -67,12 +67,17 @@ const options = {};
 const echartsStub = { init(el) { return { setOption(o) { options[el.id] = o; }, resize() {}, dispose() {} }; } };
 
 /* ---- fetch 桩：补绝对地址；记录渲染期间失败的请求；wkfail 场景让 workouts 抛错 ---- */
+// ⚠️ renderFailures 只写不删：失败时写入、后续重试成功**不会**把它清掉。
+// 所以看到警告不代表这轮一定有问题（可能是「先失败后重试成功」留下的假警告）。
+// 判据始终是**退出码**，不是「有没有 ⚠️」。
 const renderFailures = new Map();          // path -> 原因（渲染期间）
 const realFetch = globalThis.fetch;
 const SHORT = (p) => String(p).replace(/^\/api\//, '').split('&')[0];
 
 globalThis.fetch = async (u, init) => {
   const p = String(u);
+  // wkfail 是**有意注入**的故障场景：这里的失败是预期行为，
+  // 所以结论段的退出码判断要排除它（`SCEN !== 'wkfail'`）。
   if (SCEN === 'wkfail' && p.startsWith('/api/workouts')) {
     renderFailures.set(SHORT(p), '模拟故障');
     throw new Error('模拟 workouts 接口故障');
@@ -150,6 +155,12 @@ for (const [label, name, pick] of dayFinal) {
   if (!pts) { console.log('  ⏭  ' + label + '：接口没取到数据，跳过'); continue; }
   const days = pts.filter(p => pick(p) != null).map(p => p.date).sort();
   const day = days[days.length - 1] || null;
+  // ⚠️ 先断言「接口有数据 → 卡片必须有值」。少了这一条，整张卡片空掉时
+  // （值列 --、副标题「基准不足」）日期后缀断言会因为「今天不该标日期」
+  // 恰好成立而**判为通过** —— 实测被这样蒙过去一次（那轮 sleep 请求被代理丢了）。
+  const hasVal = !!c.value && c.value !== '--';
+  chk(hasVal === (day != null),
+    `${label}：接口${day ? '有数据(' + day + ')' : '无数据'} → 卡片${hasVal ? '有值' : '却是空'}，实际值 "${c.value}"`);
   chk(hasDate(c) === (day !== TODAY),
     `${label}：数据日期 ${day}${day !== TODAY ? '（非今天→该标日期）' : '（就是今天→不该标）'}，实际 "${c.sub}"`);
 }
@@ -187,17 +198,25 @@ chk(!/\d+(\.\d+)?\s*小时|h\d+m/.test(st), '不出现睡眠时长（已由 L2 �
 
 /* ---- 结论：先区分「网络丢包」与「代码错」 ---- */
 console.log('');
-if (renderFailures.size && SCEN !== 'wkfail') {
+const netNoise = renderFailures.size && SCEN !== 'wkfail';
+if (netNoise) {
   console.log('⚠️  渲染期间有请求失败，本轮结论不可信：');
   for (const [k, v] of renderFailures) console.log('     ' + k + ' → ' + v);
   console.log('   （沙箱代理在并发抓取时会丢请求；单独 curl 同一 URL 通常是 200。请重跑。）');
 }
-if (!failures.length) {
+if (!failures.length && !netNoise) {
   console.log('全部通过 ✅ (' + pass + ' 项)');
   process.exit(0);
 }
+if (!failures.length && netNoise) {
+  // 断言全过但请求有丢 —— **这不能算通过**。丢包会让卡片整体空掉，而部分断言
+  // （「今天不该标日期」这类）在空卡片上恰好成立，于是得到假绿灯。必须报「不确定」。
+  console.log('→ 断言虽全通过，但渲染期间有请求失败，其中可能包含「恰好成立」的假绿灯。');
+  console.log('   判定为「不确定」而非通过，请重跑。');
+  process.exit(2);
+}
 console.log(failures.length + ' 项不符合预期（通过 ' + pass + ' 项）');
-if (renderFailures.size && SCEN !== 'wkfail') {
+if (netNoise) {
   console.log('→ 但本轮有请求失败，判定为「不确定」而非代码问题。重跑一次再下结论。');
   process.exit(2);
 }
