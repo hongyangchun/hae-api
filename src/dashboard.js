@@ -25,6 +25,15 @@ ${msg ? `<div class="err">${msg}</div>` : ''}</div></body></html>`;
  * 宽度决定包含哪几层，不改变结构 —— 插件端只取 L1（菜单栏）或 L1+L2+L3 的裁剪版，
  * 层级定义与文案口径三端共用（见 hae-pulse 的 collector.py / render.py）。
  *
+ * **L1 只放结论，不放数值。** 状态条曾经并列 HRV / 静息心率 / 睡眠 三格，但那是
+ * L2 前三张卡的真子集（卡片多了趋势线和基准绝对值），两处相隔 16px、信息零增量，
+ * 只是看着重复。结论句里已经带了 HRV 的偏离幅度（判定的直接依据），够了。
+ *
+ * 三条贯穿全页的口径（三端共用，改要同时改 hae-pulse）：
+ *   ① 值不是今天的，旁边标数据日期（日结型指标几乎总是昨天的数）；
+ *   ② 静息心率类「越低越好」的指标方向与 HRV 相反，Δ 着色按指标方向而非箭头方向；
+ *   ③ 口径只写一份 —— 算法在服务端，判定阈值两处实现、一处在 design-notes 定。
+ *
  * 排版约定（改样式前先读）：
  *   - 字号刻度：24 卡片数值 / 15 次强调 / 13 标题 / 12 正文 / 11 辅助
  *   - 间距只用 4 / 8 / 12 / 16 / 24
@@ -68,11 +77,6 @@ h3{font-size:13px;font-weight:500;color:var(--fg2);margin:2px 6px 0}
 .status.warn .vt{color:var(--warn)}
 .status.bad .vt{color:var(--bad)}
 .lead .vh{color:var(--dim);font-size:12px;margin-top:2px}
-.kpis{display:flex;gap:16px;flex-wrap:wrap}
-.kpi{min-width:92px}
-.kpi .kk{color:var(--dim);font-size:11px}
-.kpi .kv{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}
-.kpi .kd{font-size:11px;color:var(--dim)}
 /* ---- L2 卡片 ---- */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(164px,1fr));gap:12px;margin-bottom:16px}
 .card{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
@@ -129,6 +133,8 @@ tbody tr:last-child td{border-bottom:0}
 var KEY='__READKEY__';var RANGE=90;
 var CH={},DATA={},FAIL={},P={},BUILT=false;
 function dstr(d){return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2)}
+// 今天。用来判断一个值是不是「今天的」—— 不是就要在卡片上标出数据日期。
+var TODAY=dstr(new Date());
 function from(){var d=new Date();d.setDate(d.getDate()-RANGE+1);return dstr(d)}
 function to(){var d=new Date();d.setDate(d.getDate()+1);return dstr(d)}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -197,14 +203,17 @@ function bandDesc(){var dec=Math.floor(PROF.age/10)*10;return '男 '+dec+'-'+(de
  * 方向决定 Δ 的颜色，所以同一个 ▲ 在不同卡片上可能是绿也可能是琥珀 —— 这是有意的。
  */
 function stat(pts,key,better){
- var vs=[];for(var i=0;i<pts.length;i++){var v=key?pts[i][key]:pts[i].qty;if(v!=null)vs.push(v)}
+ var vs=[],days=[];for(var i=0;i<pts.length;i++){var v=key?pts[i][key]:pts[i].qty;if(v!=null){vs.push(v);days.push(pts[i].date)}}
  if(!vs.length)return null;
  var cur=vs[vs.length-1],base=mean(vs.slice(-8,-1));
  var dp=(base)?Math.round((cur-base)/base*1000)/10:null;
  var dir=(dp!=null&&Math.abs(dp)>=1)?(dp>0?'up':'down'):null;
  var good='flat';
  if(dir!=null&&better!=='none')good=(dir===better)?'good':'bad';
- return{cur:cur,base:base,dp:dp,dir:dir,good:good,trend:vs.slice(-14)};
+ // day = 当前值那天的日期。日结型指标（静息心率/睡眠/体重/心肺耐力）在源端当天
+ // 不会有当天的点，所以这里的 day 通常不是今天 —— 卡片要把它标出来，
+ // 否则昨天的读数会被当成今天的。与 hae-pulse 两端同一规则。
+ return{cur:cur,base:base,dp:dp,dir:dir,good:good,trend:vs.slice(-14),day:days[days.length-1]};
 }
 function deltaHTML(s){
  if(!s||s.dp==null)return '<span class="delta flat">基准不足</span>';
@@ -292,9 +301,27 @@ function computeAll(){
  P.wt=stat(DATA.weight_body_mass||[],null,'none');
  P.step=stat(DATA.step_count||[],null,'up');
  P.ae=stat(DATA.active_energy||[],null,'up');
- P.ex=stat(DATA.apple_exercise_time||[],null,'up');
  P.spo2=stat(scalarize(DATA.blood_oxygen_saturation||[]),null,'none');
  P.dist=stat(DATA.walking_running_distance||[],null,'up');
+ // 锻炼 = 今日已记录的训练时长（来自 workouts，当天就有记录），不是锻炼环。
+ // 锻炼环（apple_exercise_time）是**日结型**指标，当天的值在源端不存在，拿它做
+ // 「今日锻炼」会恒为 0；workouts 是当天实时写入的，只有它当天会动。
+ // 代价：训练时长是锻炼环的子集，不计入非训练的零星活动分钟（所以叫「锻炼」不叫「活动」）。
+ var wks=DATA.workouts||[],byDay={},wcnt={},wi;
+ for(wi=0;wi<wks.length;wi++){
+  var wd=String(wks[wi].day||'');if(!wd)continue;
+  byDay[wd]=(byDay[wd]||0)+(wks[wi].duration_min||0);
+  wcnt[wd]=(wcnt[wd]||0)+1;
+ }
+ P.wkSeries=Object.keys(byDay).sort().map(function(d){return{date:d,qty:Math.round(byDay[d])}});
+ // 「近 7 天」按**日历天**算，不是「最近 7 个训练日」—— 后者在没有训练的日子会虚高
+ var wkStart=dstr(new Date(Date.now()-6*86400000)),n7=0,m7=0;
+ for(wi=0;wi<P.wkSeries.length;wi++){
+  if(P.wkSeries[wi].date>=wkStart){n7+=wcnt[P.wkSeries[wi].date]||0;m7+=P.wkSeries[wi].qty}
+ }
+ P.ex7={n:n7,min:m7};
+ P.ex=FAIL.workouts?null:{cur:Math.round(byDay[TODAY]||0),day:TODAY,
+  trend:P.wkSeries.slice(-14).map(function(p){return p.qty})};
  var sl=(DATA.sleep_analysis||[]).filter(function(x){return (x.total||0)>1});
  P.sleepPts=sl;
  P.sleep=stat(sl,'total','up');
@@ -319,18 +346,11 @@ function renderStatus(){
    fresh=' · 最新数据 '+newest.slice(5)+(gap>1?'（'+gap+' 天前，可能未同步）':'');
   }
  }
- function kpi(k,label,unit){
-  var s=k==='sleep'?P.sleep:P[k];
-  if(!s)return '<div class="kpi"><div class="kk">'+label+'</div><div class="kv">--</div><div class="kd"></div></div>';
-  var d=s.dp==null?'':(s.dp>0?'+':'')+s.dp.toFixed(1)+'%';
-  var cls=(k==='rhr')?(s.dp<=0?'good':'bad'):(s.dp>=0?'good':'bad');
-  return '<div class="kpi"><div class="kk">'+label+'</div><div class="kv">'+num(s.cur,k==='sleep'?1:0)+
-   '<span style="font-size:11px;color:var(--dim);font-weight:400"> '+unit+'</span></div>'+
-   '<div class="kd">'+(d?'<span class="delta '+(Math.abs(s.dp)>=1?cls:'flat')+'">'+d+'</span> 对比 7 日均':'基准不足')+'</div></div>';
- }
+ // L1 只放结论。这里曾经并列 HRV / 静息心率 / 睡眠 三格，但它们与 L2 前三张卡
+ // 完全重叠（卡片还多了趋势线和基准绝对值），相隔 16px 的零增量重复，已移除。
+ // 结论句里带了 HRV 的偏离幅度 —— 那是判定的直接依据（verdictOf 只看 HRV）。
  el.innerHTML='<div class="lead"><div class="vt">'+esc(vd.t)+'</div>'+
-  '<div class="vh">'+esc(vd.h)+(P.hrv&&P.hrv.dp!=null?' · HRV '+((P.hrv.dp>=0?'+':'')+P.hrv.dp.toFixed(1))+'% vs 7 日基准':'')+esc(fresh)+'</div></div>'+
-  '<div class="kpis">'+kpi('hrv','HRV','ms')+kpi('rhr','静息心率','bpm')+kpi('sleep','睡眠','小时')+'</div>';
+  '<div class="vh">'+esc(vd.h)+(P.hrv&&P.hrv.dp!=null?' · HRV '+((P.hrv.dp>=0?'+':'')+P.hrv.dp.toFixed(1))+'% vs 7 日基准':'')+esc(fresh)+'</div></div>';
 }
 /* ---- L2 卡片 ---- */
 var CARDS=[
@@ -354,9 +374,17 @@ function renderCards(){
    var vb=bandOf(s?s.cur:null);
    var dpp=(s&&s.dp!=null)?' · '+(s.dp>=0?'+':'')+s.dp.toFixed(1)+'%':'';
    d=s?(esc(vb?vb.label:'')+' · '+esc(bandDesc())+esc(dpp)):'无法估算';
+  }else if(cd.k==='ex'){
+   // 今日训练时长不跟基准比：清早还没练时 Δ 是 -100%，那是「今天刚开始」不是「退步」，
+   // 做成红色箭头会误导。所以这一格给的是「近 7 天」的频次与总时长。
+   d=P.ex?('近 7 天 '+P.ex7.n+' 次 · '+fmt(P.ex7.min,0,1)+' 分钟'):'取数失败';
   }else{
    d=deltaHTML(s);
   }
+  // 值不是今天的就标数据日期。日结型指标（静息心率/睡眠/体重/心肺耐力）在源端
+  // 当天不会有当天的点，几乎总是昨天的数 —— 不标出来会被读成今天的读数。
+  // 与 hae-pulse 两端同一条规则（collector.py 的 *_day 字段 / Main.qml 的 daySuffix）。
+  if(s&&s.day&&s.day!==TODAY)d+=' · '+esc(s.day.slice(5));
   html+='<div class="card"><div class="k">'+esc(cd.label)+'</div>'+
    '<div class="vrow"><span class="v">'+v+'</span><span class="u">'+esc(cd.unit)+'</span>'+
    (s?spark(s.trend,cd.color):'')+'</div><div class="d">'+d+'</div></div>';
@@ -460,7 +488,8 @@ function refresh(){
  if(!BUILT){buildDOM();BUILT=true}
  setAllLoading();
  document.getElementById('wk').innerHTML='<div class="state" style="height:120px">读取中…</div>';
- var core=[['heart_rate_variability'],['resting_heart_rate'],['sleep_analysis'],['weight_body_mass'],['step_count'],['apple_exercise_time'],['active_energy','&convert=kcal'],['vo2_max_est',null,1]];
+ // apple_exercise_time 不再取：锻炼改由 workouts 现算（见 computeAll），少一个请求。
+ var core=[['heart_rate_variability'],['resting_heart_rate'],['sleep_analysis'],['weight_body_mass'],['step_count'],['active_energy','&convert=kcal'],['vo2_max_est',null,1]];
  var extra=[['heart_rate'],['blood_oxygen_saturation'],['walking_running_distance']];
  var jobs=core.map(function(c){return load(c[0],c[1],c[2])});
  jobs.push(loadWorkouts());
