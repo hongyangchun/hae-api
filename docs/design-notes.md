@@ -237,23 +237,36 @@ HRV → 静息心率 → 心肺耐力(估) → 睡眠 → 体重 → 锻炼
 
 **指标分两类，取值口径必须区别对待**（2026-09-17 用 `/api/metrics` 的 `first_day`/`last_day` 分组实测）：
 
-| 类型 | 当天有值吗 | 指标 |
+| 类型 | 当天的点什么时候有 | 指标 |
 |---|---|---|
-| 实时型 | ✓ 当天就更新 | `heart_rate`、`heart_rate_variability`、`step_count`、`active_energy`、`blood_oxygen_saturation`、`walking_running_distance`、`basal_energy_burned` … |
-| **日结型** | ✗ **要等次日** | `resting_heart_rate`、`sleep_analysis`、`weight_body_mass`、`apple_exercise_time`、`walking_speed`、`respiratory_rate`、`flights_climbed` … |
+| 实时型 | 当天随时 | `heart_rate`、`heart_rate_variability`、`step_count`、`active_energy`、`blood_oxygen_saturation`、`walking_running_distance`、`basal_energy_burned` … |
+| **日结型** | **当天清晨才有** | `resting_heart_rate`、`sleep_analysis`、`weight_body_mass`、`apple_exercise_time`、`walking_speed`、`respiratory_rate`、`flights_climbed` … |
 
-Apple 在当天结束后才定稿这类日聚合值，所以**「今天」的点在源端结构性不存在**（实测
-`resting_heart_rate` 连续 19 天每天都有、唯独没有当天）。两个后果：
+日结型由**整夜**的数据算出，Apple 清晨才定稿。所以「当天的点」不是不存在，而是**来得晚** ——
+这一点很容易讲错，我们第一版就写错了：**把它当成「当天的点结构性不存在」**（依据是 09-16 那天查
+`resting_heart_rate` 发现 `last_day` 停在 09-16，当天没有）。第二天早上再查，`last_day` 已经是 09-17、
+值是 58 —— 当天的点照样会出现。两种状态都真实存在，取决于你什么时候查：
 
-1. **取数只能「取最近可用值」**，不能只取今天。`collector.py` 的 `latest()` 与 `dashboard.js` 的
-   `stat()` 都取最后一个非空值 —— 仪表盘一直显示正常正因为它这么做，而插件曾经只取今天，
-   于是静息心率恒为 `—`、锻炼恒为 0。
-2. **值不是今天的，界面必须标出数据日期**（` · MM-DD`）。三端同一规则：
+```
+09-16 查 resting_heart_rate → last_day = 09-16（当天无点）→ 插件显示 —   ← 用户报的就是这个
+09-17 查 resting_heart_rate → last_day = 09-17、值 58（清晨已落库）→ 正常显示
+```
+
+**结论：口径写死成「永远取今天」或「永远取昨天」都是错的，只能「取最后一个非空值 + 按日期判断要不要标」。**
+两个后果：
+
+1. **取数取「最后一个非空值」**，不能只取今天。`collector.py` 的 `latest()` 与 `dashboard.js` 的
+   `stat()` 都这么做 —— 仪表盘一直显示正常正因为它这么做，而插件曾经只取今天，
+   于是在清晨前静息心率恒为 `—`、锻炼恒为 0。
+2. **值不是今天的才标数据日期**（` · MM-DD`），是今天的就不标（标了是冗余）。三端同一规则：
    `render.py` 的 `day_suffix()` / `Main.qml` 的 `daySuffix()` / `dashboard.js` 里比 `s.day` 与 `TODAY`。
    不标的话，昨天的读数会被当成今天的 —— 这是健康面板最不能出的一类错。
    HRV 是例外：它取不到今天时走「昨日 X ms」文案，不在日期后缀这套里。
 
 顺带：`vo2_max_est` 是服务端派生指标，但它的输入是静息心率的 7 日滚动窗口，**因此继承了同样的滞后**。
+
+排查入口：`/api/metrics` 的 `last_day` 是判断「源端到底有没有这个点」最快的一招 ——
+一眼看出是取数口径的问题还是源端真没数据。**但它是会每天变化的，不能当固定属性背下来。**
 
 ### 9. 一个信息面就够，别做第二个
 
@@ -261,6 +274,12 @@ macOS 曾经有两个信息面：SwiftBar 下拉 + 一个 `panel.html` 的 webvi
 （hero / sparkline / 生命体征行 / 训练表全都有），等于同一屏东西看两遍。Omarchy 端本来就只有
 一个面（bar 只放数字，弹层放全部）。所以**面板整个删掉**，下拉就是那个弹层 ——
 要更长的历史去网页仪表盘（下拉底部保留了入口）。**新增信息面之前先问：下拉真的放不下吗？**
+
+**注意「信息面」和「文案面」不是一回事。** Omarchy 一个文件里其实有 4 份文案：bar 数字、
+hover tooltip、popout 行、外加 macOS 下拉。删掉一层 UI 不等于只剩一份文案 ——
+**文案面照样会各自漂移**。这次复查就发现 tooltip 漏了静息心率（用户报的正是「静息心率不显示」）、
+行序与 popout 不同、且没走日期后缀与千分位。所以规则是：
+**同一个量出现在几处，就有几处要改；行序、口径、日期规则、数字格式四样必须逐处对齐。**
 
 ### 10. 无障碍（实测，不靠感觉）
 
@@ -354,21 +373,33 @@ npx wrangler deploy                                 # 自动绑定 hae.qiaclass.
     —— 两处都是「接口 200、页面不报错、就是没数」。做法：在 Node 里用桩 `document` / 桩 `echarts`
     （记得 `window.echarts`，脚本读的是 `window` 上的）+ 一个把相对路径补成绝对地址的 `fetch` 桩，
     跑真正的 `render()`，打印实际生成的卡片文案和 `setOption` 的 option。
+    **已经固化成 `scripts/verify_dashboard_cards.mjs`**，直接跑就行，不要再一次性写：
+    ```bash
+    node scripts/verify_dashboard_cards.mjs          # 实时场景
+    node scripts/verify_dashboard_cards.mjs wkfail   # 失败态
+    DASH_HTML=/tmp/live_dash.html node scripts/...   # 验线上那份
+    ```
+    退出码分了 **0 通过 / 1 真的断言失败 / 2 不确定（网络丢请求）** —— 脚本内部记录
+    「渲染期间哪些请求失败」来区分代码问题与网络抖动。**这一点很关键**：沙箱代理并发抓取时
+    会随机丢请求，不分流的话每次红灯都要人肉判断，验几次就没人看了。
     **入口直接 `import { dashboardHTML }`，不要 curl 线上页面再正则抽脚本** ——
     本地就是源码真值，少一次网络、改完不必先部署就能验。
     而且**从源码验模板字符串里的转义会得出相反结论**（源码写 `\\B`，求值后才是 `\B`），
     要验正则必须验**求值之后**的那份脚本。
     另外两件必须一起做：**数请求条数**（曾漏调 `loadWorkouts()` 导致锻炼记录恒空，
     只有数条数才发现）和**线上/本地脚本逐字节对拍**（确认部署的确实是验过的那份）。
-16. **日结型指标的「今天」在源端不存在 —— 这是本栈最容易反复踩的一类坑**（2026-09-17 修）：
-    `resting_heart_rate` 连续 19 天每天都有、唯独没有当天，`sleep_analysis` / `weight_body_mass` /
-    `apple_exercise_time` 同样。Apple 在当天结束后才定稿这类日聚合值。后果是：
-    仪表盘一直正常（`stat()` 取最后一个非空值），而 pulse 插件用 `rhr.get(str(TODAY))`
-    **恒定拿到 None，静息心率永远显示 `—`**；同样口径的 `exercise_min_today = ex.get(t, 0)`
-    让锻炼永远显示 `0 / 30 分钟`。同文件里 HRV 早就有 `hrv_yesterday` 回退，静息心率漏了
-    —— **是不一致，不是数据问题**。判断「源端到底有没有」最快的入口是 `/api/metrics` 的
-    `last_day`：实时型是今天、日结型是昨天，一眼分组，比逐个 `/api/query` 快得多。
-    修法：取「最近可用值」+ 把日期带出去 + 界面标 ` · MM-DD`（见第四节 8）。
+16. **日结型指标「当天的点来得晚」，不是「不存在」—— 这是本栈最容易反复踩的一类坑**（2026-09-17 修）：
+    `resting_heart_rate` / `sleep_analysis` / `weight_body_mass` / `apple_exercise_time` 由整夜数据
+    算出，Apple **清晨**才定稿。查的时点不同，看到的东西完全不同：09-16 查 `last_day` 停在 09-16
+    （当天无点），09-17 早上查 `last_day` 已经是 09-17、值 58（已落库）。我们第一版把这段结论写成
+    「当天的点在源端结构性不存在」，**这句话本身就成了下一个坑** —— 它会让后来的人（和写过的测试）
+    认定「这些卡片必须永远带日期」，等清晨的点落库后反而误判成 bug。
+    真正的后果是：仪表盘一直正常（`stat()` 取最后一个非空值），而 pulse 插件用 `rhr.get(str(TODAY))`
+    在清晨前**恒定拿到 None，静息心率显示 `—`**；同口径的 `exercise_min_today = ex.get(t, 0)`
+    让锻炼恒显示 `0 / 30 分钟`。同文件里 HRV 早就有 `hrv_yesterday` 回退，静息心率漏了
+    —— **是不一致，不是数据问题**。
+    修法：取「最后一个非空值」+ 把日期带出去 + 界面按日期决定标不标 ` · MM-DD`（见第四节 8）。
+    排查入口是 `/api/metrics` 的 `last_day`，但**要记住它每天会变**，只能当「此刻源端有没有」的快照。
 
 
 ## 七、运维备忘

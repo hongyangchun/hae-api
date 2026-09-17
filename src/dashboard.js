@@ -30,7 +30,7 @@ ${msg ? `<div class="err">${msg}</div>` : ''}</div></body></html>`;
  * 只是看着重复。结论句里已经带了 HRV 的偏离幅度（判定的直接依据），够了。
  *
  * 三条贯穿全页的口径（三端共用，改要同时改 hae-pulse）：
- *   ① 值不是今天的，旁边标数据日期（日结型指标几乎总是昨天的数）；
+ *   ① 值不是今天的，旁边标数据日期（日结型指标清晨前仍是昨天的数）；
  *   ② 静息心率类「越低越好」的指标方向与 HRV 相反，Δ 着色按指标方向而非箭头方向；
  *   ③ 口径只写一份 —— 算法在服务端，判定阈值两处实现、一处在 design-notes 定。
  *
@@ -210,9 +210,9 @@ function stat(pts,key,better){
  var dir=(dp!=null&&Math.abs(dp)>=1)?(dp>0?'up':'down'):null;
  var good='flat';
  if(dir!=null&&better!=='none')good=(dir===better)?'good':'bad';
- // day = 当前值那天的日期。日结型指标（静息心率/睡眠/体重/心肺耐力）在源端当天
- // 不会有当天的点，所以这里的 day 通常不是今天 —— 卡片要把它标出来，
- // 否则昨天的读数会被当成今天的。与 hae-pulse 两端同一规则。
+ // day = 当前值那天的日期。日结型指标（静息心率/睡眠/体重/心肺耐力）由整夜数据
+ // 算出，Apple 清晨才定稿：清晨前最新点是昨天的，清晨后当天的点就出现了。所以
+ // day 可能等于今天也可能不是 —— 卡片按日期决定标不标，与 hae-pulse 两端同规则。
  return{cur:cur,base:base,dp:dp,dir:dir,good:good,trend:vs.slice(-14),day:days[days.length-1]};
 }
 function deltaHTML(s){
@@ -304,7 +304,7 @@ function computeAll(){
  P.spo2=stat(scalarize(DATA.blood_oxygen_saturation||[]),null,'none');
  P.dist=stat(DATA.walking_running_distance||[],null,'up');
  // 锻炼 = 今日已记录的训练时长（来自 workouts，当天就有记录），不是锻炼环。
- // 锻炼环（apple_exercise_time）是**日结型**指标，当天的值在源端不存在，拿它做
+ // 锻炼环（apple_exercise_time）是**日结型**指标，清晨前当天的值拿不到，拿它做
  // 「今日锻炼」会恒为 0；workouts 是当天实时写入的，只有它当天会动。
  // 代价：训练时长是锻炼环的子集，不计入非训练的零星活动分钟（所以叫「锻炼」不叫「活动」）。
  var wks=DATA.workouts||[],byDay={},wcnt={},wi;
@@ -381,8 +381,8 @@ function renderCards(){
   }else{
    d=deltaHTML(s);
   }
-  // 值不是今天的就标数据日期。日结型指标（静息心率/睡眠/体重/心肺耐力）在源端
-  // 当天不会有当天的点，几乎总是昨天的数 —— 不标出来会被读成今天的读数。
+  // 值不是今天的就标数据日期。日结型指标（静息心率/睡眠/体重/心肺耐力）清晨前
+  // 最新点还是昨天的，清晨后当天的点才出现 —— 不标出来会被读成今天的读数。
   // 与 hae-pulse 两端同一条规则（collector.py 的 *_day 字段 / Main.qml 的 daySuffix）。
   if(s&&s.day&&s.day!==TODAY)d+=' · '+esc(s.day.slice(5));
   html+='<div class="card"><div class="k">'+esc(cd.label)+'</div>'+

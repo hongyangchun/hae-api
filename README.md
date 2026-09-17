@@ -66,9 +66,24 @@ Automations → New Automation（健康指标、锻炼各建一个）：
 ## 本地验证
 
 ```bash
-node scripts/test_ingest.mjs   # 用 iCloud 里真实导出数据跑解析+mock 入库
-npx wrangler dev               # 本地起 Worker，curl POST /api/data 实测
+node scripts/test_ingest.mjs            # 用 iCloud 里真实导出数据跑解析+mock 入库
+node scripts/verify_dashboard_cards.mjs # 卡片渲染断言（桩 DOM 跑真脚本，见下）
+npx wrangler dev                        # 本地起 Worker，curl POST /api/data 实测
 ```
+
+`verify_dashboard_cards.mjs` 用桩 `document` / 桩 `echarts` 在 Node 里跑仪表盘真正的那段
+内联脚本，然后读**实际渲染出来的文案**做断言。仪表盘的 bug 基本都是「接口 200、页面不报错、
+就是数不对」，静态读代码看不出来 —— 这个脚本是唯一能在没有浏览器的情况下验「看到的对不对」的办法。
+
+```bash
+node scripts/verify_dashboard_cards.mjs          # 实时场景
+node scripts/verify_dashboard_cards.mjs wkfail   # 模拟 /api/workouts 故障，验失败态不崩、不显示 0
+DASH_HTML=/tmp/live_dash.html node scripts/verify_dashboard_cards.mjs   # 验线上部署的那一份
+```
+
+退出码 **0 通过 / 1 真的断言失败（去改代码）/ 2 不确定（网络把请求丢了，重跑）**。
+它自己记录「渲染期间哪些请求失败」并据此区分代码问题与网络抖动 —— 否则每次跑完都要人肉判断
+这次的红是代码还是网络，验着验着就没人看了。
 
 ## 文档
 
