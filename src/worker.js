@@ -602,6 +602,67 @@ async function handleWorkouts(url, env) {
   return json({ workouts: results });
 }
 
+// 训练明细：/api/workout-detail?id=<workout id>
+// 从 raw JSON 提炼逐分钟心率/能量/步频序列、强度、环境与活动类型等（raw 全文不返回）
+// ?max_points=N 时对时间序列等距抽样（默认 0 = 全量）
+async function handleWorkoutDetail(url, env) {
+  const id = url.searchParams.get('id');
+  if (!id) return json({ error: 'missing ?id=' }, 400);
+  const { results } = await env.DB.prepare(
+    `SELECT id, name, day, start, end, duration_min, kcal, distance, distance_units,
+            avg_hr, max_hr, source, raw
+     FROM workouts WHERE id = ?1`,
+  ).bind(id).all();
+  if (!results.length) return json({ error: 'workout not found', id }, 404);
+
+  const w = results[0];
+  let raw = null;
+  try { raw = JSON.parse(w.raw || 'null'); } catch { /* raw 损坏时按 null 降级 */ }
+
+  const maxPoints = parseInt(url.searchParams.get('max_points') || '0', 10) || 0;
+  const sample = (arr) => {
+    if (!Array.isArray(arr) || !maxPoints || arr.length <= maxPoints) return arr || [];
+    const step = (arr.length - 1) / (maxPoints - 1);
+    return Array.from({ length: maxPoints }, (_, i) => arr[Math.round(i * step)]);
+  };
+
+  const pickSeries = (arr, fields) => sample(arr || []).map((p) => {
+    const out = { date: p.date };
+    for (const [key, src] of fields) if (p[src] !== undefined) out[key] = p[src];
+    return out;
+  });
+
+  const activity = raw?.activities?.[0] || null;
+  const detail = {
+    id: w.id, name: w.name, day: w.day, start: w.start, end: w.end,
+    duration_min: w.duration_min, kcal: w.kcal,
+    distance: w.distance, distance_units: w.distance_units,
+    avg_hr: w.avg_hr, max_hr: w.max_hr, source: w.source,
+    activity_type: activity?.activityType || null,
+    // kcal/kg·h 强度（与 physical_effort 换算相关）
+    intensity: raw?.intensity ? { qty: raw.intensity.qty, units: raw.intensity.units } : null,
+    weather: raw?.temperature || raw?.humidity
+      ? {
+          temperature_c: raw?.temperature?.qty ?? null,
+          humidity_pct: raw?.humidity?.qty ?? null,
+        }
+      : null,
+    step_cadence: raw?.stepCadence ? { qty: raw.stepCadence.qty, units: raw.stepCadence.units } : null,
+    basal_energy_kj_total: Array.isArray(raw?.basalEnergy)
+      ? Math.round(raw.basalEnergy.reduce((s, p) => s + (p.qty || 0), 0) * 10) / 10
+      : null,
+    heart_rate_series: pickSeries(raw?.heartRateData, [['avg', 'Avg'], ['min', 'Min'], ['max', 'Max']]),
+    active_energy_series_kj: pickSeries(raw?.activeEnergy, [['kj', 'qty']]),
+    steps_series: pickSeries(raw?.stepCount, [['steps', 'qty']]),
+    series_points_raw: {
+      heart_rate: Array.isArray(raw?.heartRateData) ? raw.heartRateData.length : 0,
+      active_energy: Array.isArray(raw?.activeEnergy) ? raw.activeEnergy.length : 0,
+      steps: Array.isArray(raw?.stepCount) ? raw.stepCount.length : 0,
+    },
+  };
+  return json(detail);
+}
+
 /* ---------- 入口 ---------- */
 
 export default {
@@ -640,6 +701,7 @@ export default {
       if (path === '/api/metrics') return handleMetrics(env);
       if (path === '/api/query') return handleQuery(url, env);
       if (path === '/api/workouts') return handleWorkouts(url, env);
+      if (path === '/api/workout-detail') return handleWorkoutDetail(url, env);
     }
 
     return json({ error: 'not found' }, 404);

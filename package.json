@@ -1,5 +1,9 @@
 {
   "name": "hae-api",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "cf": "^1.0.0-beta.5",
+    "wrangler": "^4.143.0"
+  }
 }

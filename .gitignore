@@ -1,6 +1,9 @@
 node_modules/
+wrangler.toml
+keys.local.md
+.cloudflare/
 .wrangler/
 .dev.vars
-keys.local.md
 *.local.md
 方案与配置笔记.md
+package-lock.json
